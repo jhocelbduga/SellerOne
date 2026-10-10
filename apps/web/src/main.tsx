@@ -57,7 +57,19 @@ interface Customer {
   orderCount?: number;
   spentMinor?: number;
   createdAt?: string;
+  facebookUrl?: string | null;
+  instagramUrl?: string | null;
+  tiktokUrl?: string | null;
+  whatsappUrl?: string | null;
+  websiteUrl?: string | null;
 }
+const customerSocialPlatforms = [
+  { field: "facebookUrl", label: "Facebook", placeholder: "https://www.facebook.com/username" },
+  { field: "instagramUrl", label: "Instagram", placeholder: "https://www.instagram.com/username" },
+  { field: "tiktokUrl", label: "TikTok", placeholder: "https://www.tiktok.com/@username" },
+  { field: "whatsappUrl", label: "WhatsApp", placeholder: "https://wa.me/12025550101" },
+  { field: "websiteUrl", label: "Website", placeholder: "https://example.com" },
+] as const;
 
 const SessionContext = createContext<SessionState>({
   user: null,
@@ -737,12 +749,12 @@ function MovementList(): React.JSX.Element {
   ]} />;
 }
 
-function Modal({ title, children, onClose }: { title: string; children: React.ReactNode; onClose: () => void }): React.JSX.Element {
+function Modal({ title, children, onClose, eyebrow = "INVENTORY" }: { title: string; children: React.ReactNode; onClose: () => void; eyebrow?: string }): React.JSX.Element {
   useEffect(() => {
     const handler = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };
     window.addEventListener("keydown", handler); return () => window.removeEventListener("keydown", handler);
   }, [onClose]);
-  return <div className="modal-scrim" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><div className="modal-card" role="dialog" aria-modal="true" aria-label={title}><div className="modal-heading"><div><span className="page-eyebrow">INVENTORY</span><h2>{title}</h2></div><IconButton label="Close" onClick={onClose}><X size={18} /></IconButton></div>{children}</div></div>;
+  return <div className="modal-scrim" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><div className="modal-card" role="dialog" aria-modal="true" aria-label={title}><div className="modal-heading"><div><span className="page-eyebrow">{eyebrow}</span><h2>{title}</h2></div><IconButton label="Close" onClick={onClose}><X size={18} /></IconButton></div>{children}</div></div>;
 }
 
 function CustomersPage(): React.JSX.Element {
@@ -773,15 +785,43 @@ function CustomersPage(): React.JSX.Element {
   </>;
 }
 
+function CustomerSocialCard({ customer, saved }: { customer: Customer; saved: () => void }): React.JSX.Element {
+  const [editing, setEditing] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const links = customerSocialPlatforms.filter(({ field }) => customer[field]);
+  const save = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault(); if (busy) return;
+    const fields = Object.fromEntries(new FormData(event.currentTarget));
+    setBusy(true); setError("");
+    try { await api(`/customers/${customer.id}`, { method: "PATCH", body: JSON.stringify(fields) }); setEditing(false); saved(); }
+    catch (caught) { setError(caught instanceof Error ? caught.message : "Could not save social media links."); }
+    finally { setBusy(false); }
+  };
+  return <article className="stat-card customer-social-card">
+    <div className="stat-top"><span>Social media links</span><span className="stat-icon icon-blue"><Users size={17} /></span></div>
+    {links.length ? <ul>{links.map(({ field, label }) => <li key={field}><a className="inline-link" href={customer[field] ?? undefined} target="_blank" rel="noopener noreferrer">{label}<ArrowUpRight size={13} /></a></li>)}</ul> : <p>No social media links added.</p>}
+    <button type="button" className="text-button commerce-no-print" onClick={() => { setError(""); setEditing(true); }}>{links.length ? "Edit links" : "Add links"}</button>
+    {editing && <Modal title="Customer social media links" eyebrow="CUSTOMER BOOK" onClose={() => setEditing(false)}>
+      <form className="modal-form" onSubmit={(event) => void save(event)}>
+        <p>Add full HTTPS links for this customer. Leave a field blank to remove its link. These links do not connect or verify social accounts.</p>
+        {error && <PageError message={error} />}
+        {customerSocialPlatforms.map(({ field, label, placeholder }) => <label key={field} className="field-label">{label}<input type="url" name={field} defaultValue={customer[field] ?? ""} maxLength={2000} placeholder={placeholder} /></label>)}
+        <div className="modal-actions"><Button type="button" variant="secondary" onClick={() => setEditing(false)}>Cancel</Button><Button type="submit" disabled={busy}>{busy ? "Saving..." : "Save links"}</Button></div>
+      </form>
+    </Modal>}
+  </article>;
+}
+
 function CustomerProfilePage(): React.JSX.Element {
   const { id } = useParams();
-  const { data, error, loading } = useLoad<Record<string, unknown>>(`/customers/${id}`);
+  const { data, error, loading, reload } = useLoad<Customer & { orders: Record<string, unknown>[] }>(`/customers/${id}`);
   if (loading) return <LoadingGrid />;
   if (error || !data) return <PageError message={error || "Customer not found."} />;
   return <>
     <Link className="back-link" to="/customers"><ChevronLeft size={15} /> Back to customers</Link>
     <PageHeading eyebrow="YOUR CUSTOMER BOOK" title={String(data.name)} description={`A customer since ${dateLabel(data.createdAt)}.`} action={<Button variant="secondary" onClick={() => window.print()}><FileText size={16} /> Print profile</Button>} />
-    <div className="stat-grid stat-grid-three"><StatCard label="Lifetime sales" value={money(data.spentMinor)} icon={<Wallet size={17} />} /><StatCard label="Orders" value={String(data.orderCount ?? 0)} icon={<ShoppingBag size={17} />} tone="blue" /><StatCard label="Contact" value={String(data.email || data.phone || "Not added")} icon={<UserRound size={17} />} tone="lilac" /></div>
+    <div className="stat-grid customer-summary-grid"><StatCard label="Lifetime sales" value={money(data.spentMinor)} icon={<Wallet size={17} />} /><StatCard label="Orders" value={String(data.orderCount ?? 0)} icon={<ShoppingBag size={17} />} tone="blue" /><StatCard label="Contact" value={String(data.email || data.phone || "Not added")} icon={<UserRound size={17} />} tone="lilac" /><CustomerSocialCard customer={data} saved={reload} /></div>
     <div className="detail-grid customer-detail-grid"><section className="panel"><SectionHeading title="Order history" subtitle="A little history, a lot of context." /><DataTable rowKey="id" rows={data.orders as Record<string, unknown>[]} empty="There are no orders for this customer yet." columns={[
       { label: "ORDER", render: (row) => <Link className="table-primary" to={`/orders/${row.id}`}>{String(row.orderNumber)}</Link> },
       { label: "DATE", render: (row) => dateLabel(row.createdAt) },
@@ -797,6 +837,7 @@ function TransactionsPage({ type }: { type: "sales" | "expenses" }): React.JSX.E
   const customers = useLoad<{ items: Customer[] }>("/customers");
   const settings = useLoad<{ currency: string }>("/settings");
   const [modal, setModal] = useState(false);
+  const [selectedExpense, setSelectedExpense] = useState<Record<string, unknown> | null>(null);
   const [message, setMessage] = useState("");
   const currency = settings.data?.currency ?? "PHP";
   const items = data?.items ?? [];
@@ -811,6 +852,7 @@ function TransactionsPage({ type }: { type: "sales" | "expenses" }): React.JSX.E
   };
   return <>
     <PageHeading eyebrow={type === "sales" ? "MONEY IN" : "MONEY OUT"} title={type === "sales" ? "Sales" : "Expenses"} description={type === "sales" ? "Keep a clear record of what your hard work brings in." : "The cost of doing business, all in one tidy place."} action={<Button onClick={() => setModal(true)}><Plus size={17} /> {type === "sales" ? "Record a sale" : "Add an expense"}</Button>} />
+    {type === "sales" && <p>Completed orders appear here automatically. Open their order to view or print the invoice. Delivered orders are not recorded as sales until marked completed.</p>}
     {error && <PageError message={error} />}{message && <div className="success-box">{message}</div>}
     <div className="stat-grid stat-grid-three"><StatCard label={`Total ${type}`} value={money(items.reduce((sum, row) => sum + Number(amount(row) ?? 0), 0), currency)} change="All recorded transactions" icon={type === "sales" ? <TrendingUp size={17} /> : <TrendingDown size={17} />} /><StatCard label="This month" value={money(items.filter((row) => new Date(String(row.createdAt ?? row.created_at)).getMonth() === new Date().getMonth()).reduce((sum, row) => sum + Number(amount(row) ?? 0), 0), currency)} change="In the current calendar month" icon={<ChartNoAxesCombined size={17} />} tone="blue" /><StatCard label="Entries" value={String(items.length)} change="Your transaction history" icon={<FileText size={17} />} tone="sand" /></div>
     <section className="panel list-panel"><div className="list-toolbar"><div><h2 className="inline-panel-title">All {type}</h2><span className="result-count">{items.length} entries</span></div><span className="soft-tag"><Activity size={13} /> UPDATED JUST NOW</span></div>{loading ? <div className="table-skeleton" /> : <DataTable rowKey="id" rows={items} empty={`Your ${type} entries will appear here.`} columns={type === "sales" ? [
@@ -818,12 +860,25 @@ function TransactionsPage({ type }: { type: "sales" | "expenses" }): React.JSX.E
       { label: "CHANNEL", render: (row) => <span className="channel-tag">{String(row.channel)}</span> },
       { label: "DATE", render: (row) => dateLabel(row.createdAt ?? row.created_at) },
       { label: "AMOUNT", className: "align-right", render: (row) => <strong>{money(amount(row), String(row.currency ?? currency))}</strong> },
+      { label: "DETAILS", render: (row) => typeof row.orderId === "string" && row.orderId ? <Link className="inline-link" to={`/orders/${encodeURIComponent(row.orderId)}`}>View order / invoice</Link> : <span className="muted">Manual sale</span> },
     ] : [
       { label: "EXPENSE", render: (row) => <span><strong>{String(row.description)}</strong><small>{String(row.notes ?? "—")}</small></span> },
       { label: "CATEGORY", render: (row) => <span className="channel-tag">{String(row.category)}</span> },
       { label: "DATE", render: (row) => dateLabel(row.createdAt ?? row.created_at) },
       { label: "AMOUNT", className: "align-right", render: (row) => <strong>{money(amount(row), String(row.currency ?? currency))}</strong> },
+      { label: "DETAILS", render: (row) => <button type="button" className="text-button" aria-label={`View details for ${String(row.description)}`} onClick={() => setSelectedExpense(row)}>View details <ChevronRight size={14} /></button> },
     ]} />}</section>
+    {type === "expenses" && selectedExpense && <Modal title="Expense details" eyebrow="MONEY OUT" onClose={() => setSelectedExpense(null)}>
+      <dl className="expense-detail">
+        <dt>Description</dt><dd>{String(selectedExpense.description)}</dd>
+        <dt>Category</dt><dd>{String(selectedExpense.category)}</dd>
+        <dt>Recorded date</dt><dd>{dateLabel(selectedExpense.createdAt ?? selectedExpense.created_at)}</dd>
+        <dt>Amount</dt><dd>{money(amount(selectedExpense), String(selectedExpense.currency ?? currency))}</dd>
+        <dt>Notes</dt><dd>{String(selectedExpense.notes || "No notes added.")}</dd>
+        <dt>Entry ID</dt><dd className="mono">{String(selectedExpense.id)}</dd>
+      </dl>
+      <div className="modal-actions"><Button type="button" variant="secondary" onClick={() => setSelectedExpense(null)}>Close details</Button></div>
+    </Modal>}
     {modal && <Modal title={type === "sales" ? "Record a sale" : "Add an expense"} onClose={() => setModal(false)}><form className="modal-form" onSubmit={(event) => void submit(event)}><label className="field-label">{type === "sales" ? "What did you sell?" : "What was the expense?"}<input name="description" required maxLength={500} /></label>{type === "sales" ? <><label className="field-label">Customer<select name="customerId"><option value="">Walk-in customer</option>{customers.data?.items.map((customer) => <option key={customer.id} value={customer.id}>{customer.name}</option>)}</select></label><label className="field-label">Customer name <span className="field-optional">IF WALK-IN</span><input name="customerName" placeholder="Walk-in customer" /></label><label className="field-label">Channel<select name="channel"><option>Manual</option><option>Facebook</option><option>Instagram</option><option>TikTok Shop</option><option>Messenger</option></select></label></> : <label className="field-label">Category<select name="category"><option>Supplies</option><option>Shipping</option><option>Marketing</option><option>Utilities</option><option>Rent</option><option>Software</option><option>Other</option></select></label>}<label className="field-label">Amount ({currency})<input type="number" name="amount" min="0" step="0.01" required /></label>{type === "expenses" && <label className="field-label">Notes<input name="notes" maxLength={500} /></label>}<div className="modal-actions"><Button type="button" variant="secondary" onClick={() => setModal(false)}>Cancel</Button><Button type="submit">Save {type === "sales" ? "sale" : "expense"}</Button></div></form></Modal>}
   </>;
 }
@@ -857,15 +912,16 @@ function ReportsPage(): React.JSX.Element {
     <PageHeading eyebrow="THE BIGGER PICTURE" title="Reports" description="Take a breath, zoom out, and see how things are going." action={<Button variant="secondary" onClick={() => window.print()}><FileText size={16} /> Export report</Button>} />
     {error && <PageError message={error} />}{loading && <LoadingGrid />}
     {!loading && <><div className="report-filter"><span className="filter-icon"><SlidersHorizontal size={15} /></span><span>Reporting currency <strong>{currency}</strong></span><span className="report-date">Updated just now</span></div><div className="stat-grid stat-grid-three"><StatCard label="Gross sales" value={money(totalSales, currency)} change={`${sales.length} daily entries`} icon={<TrendingUp size={17} />} /><StatCard label="Expenses" value={money(totalExpenses, currency)} change={`${expenses.length} categories`} icon={<TrendingDown size={17} />} tone="sand" /><StatCard label="Net income" value={money(totalSales - totalExpenses, currency)} change="Recorded sales less expenses" icon={<ChartNoAxesCombined size={17} />} tone="blue" /></div>
-      <div className="report-grid"><section className="panel"><SectionHeading title="Sales by day" subtitle="The last 90 days" /><DataTable rowKey="day" rows={sales} empty="Record a sale to start your sales report." columns={[
-        { label: "DAY", render: (row) => dateLabel(row.day) },
+      <p>Sales and expenses cover the last 90 calendar days, including today, in {String(data?.timezone ?? "Asia/Manila")}. Sales include completed orders and manually recorded sales only.</p>
+      <div className="report-grid"><section className="panel"><SectionHeading title="Sales by day" subtitle="The last 90 calendar days" /><DataTable rowKey="day" rows={sales} empty="No sales in this period. Mark a delivered order completed or record a manual sale to include it here." columns={[
+        { label: "DAY", render: (row) => dateLabel(`${String(row.day)}T12:00:00`) },
         { label: "TRANSACTIONS", render: (row) => String(row.transactionCount) },
         { label: "SALES", className: "align-right", render: (row) => <strong>{money(row.amountMinor, currency)}</strong> },
-      ]} /></section><section className="panel"><SectionHeading title="Expenses by category" subtitle="Where your costs go" /><DataTable rowKey="category" rows={expenses} empty="Add expenses to see where your costs go." columns={[
+      ]} /></section><section className="panel"><SectionHeading title="Expenses by category" subtitle="The last 90 calendar days" /><DataTable rowKey="category" rows={expenses} empty="No expenses recorded in this period." columns={[
         { label: "CATEGORY", render: (row) => <span className="channel-tag">{String(row.category)}</span> },
         { label: "ENTRIES", render: (row) => String(row.transactionCount) },
         { label: "TOTAL", className: "align-right", render: (row) => <strong>{money(row.amountMinor, currency)}</strong> },
-      ]} /></section><section className="panel report-orders"><SectionHeading title="Orders by status" subtitle="A quick pulse on fulfillment" /><DataTable rowKey="status" rows={orders} empty="Your order report will appear when you start tracking orders." columns={[
+      ]} /></section><section className="panel report-orders"><SectionHeading title="Orders by status" subtitle="All-time fulfillment status" /><DataTable rowKey="status" rows={orders} empty="Your order report will appear when you start tracking orders." columns={[
         { label: "STATUS", render: (row) => <StatusPill status={String(row.status)} /> },
         { label: "ORDERS", render: (row) => String(row.count) },
         { label: "ORDER TOTAL", className: "align-right", render: (row) => <strong>{money(row.amountMinor, currency)}</strong> },
@@ -874,21 +930,56 @@ function ReportsPage(): React.JSX.Element {
 }
 
 function SettingsPage(): React.JSX.Element {
+  const location = useLocation();
+  const navigate = useNavigate();
+  const tab = location.hash === "#preferences" ? "preferences" : "business";
   const { data, loading, error } = useLoad<{ businessName: string; currency: string; timezone: string; lowStockEmailAlerts: boolean }>("/settings");
   const [form, setForm] = useState<{ businessName: string; currency: string; timezone: string; lowStockEmailAlerts: boolean } | null>(null);
   const [notice, setNotice] = useState("");
   const [problem, setProblem] = useState("");
+  const [saving, setSaving] = useState(false);
   useEffect(() => { if (data && !form) setForm(data); }, [data, form]);
   const change = (key: keyof NonNullable<typeof form>, value: string | boolean) => setForm((current) => current ? { ...current, [key]: value } : current);
   const save = async (event: React.FormEvent) => {
-    event.preventDefault(); if (!form) return; setNotice(""); setProblem("");
-    try { await api("/settings", { method: "PATCH", body: JSON.stringify(form) }); setNotice("Your workspace settings are saved."); }
+    event.preventDefault(); if (!form || saving) return; setNotice(""); setProblem(""); setSaving(true);
+    const payload = tab === "preferences" ? { lowStockEmailAlerts: form.lowStockEmailAlerts }
+      : { businessName: form.businessName, currency: form.currency, timezone: form.timezone };
+    try { await api("/settings", { method: "PATCH", body: JSON.stringify(payload) }); setNotice(`${tab === "preferences" ? "Preferences" : "Business details"} saved.`); }
     catch (caught) { setProblem(caught instanceof Error ? caught.message : "Could not save settings."); }
+    finally { setSaving(false); }
+  };
+  const selectTab = (selected: "business" | "preferences") => {
+    navigate(`#${selected}`);
+    setNotice(""); setProblem("");
+  };
+  const tabKeys = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    if (!["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+    event.preventDefault();
+    const selected = event.key === "Home" ? "business" : event.key === "End" ? "preferences" : tab === "business" ? "preferences" : "business";
+    selectTab(selected);
+    document.getElementById(`settings-tab-${selected}`)?.focus();
   };
   return <>
     <PageHeading eyebrow="MAKE IT YOURS" title="Settings" description="The little details that make this workspace feel like yours." />
     {error && <PageError message={error} />}{notice && <div className="success-box"><ShieldCheck size={17} />{notice}</div>}{problem && <PageError message={problem} />}
-    {loading || !form ? <LoadingGrid /> : <form onSubmit={(event) => void save(event)} className="settings-layout"><div className="settings-nav"><a className="settings-nav-item active" href="#business">Business details</a><a className="settings-nav-item" href="#preferences">Preferences</a><Link className="settings-nav-item" to="/users">Team & access <ChevronRight size={14} /></Link></div><div className="settings-sections"><section className="panel form-panel" id="business"><SectionHeading title="Business details" subtitle="The name and currency used across your workspace." /><div className="form-grid"><label className="field-label field-span">Business name<input required maxLength={200} value={form.businessName} onChange={(event) => change("businessName", event.target.value)} /></label><label className="field-label">Default currency<select value={form.currency} onChange={(event) => change("currency", event.target.value)}><option value="PHP">PHP — Philippine peso</option><option value="USD">USD — US dollar</option><option value="SGD">SGD — Singapore dollar</option><option value="AUD">AUD — Australian dollar</option><option value="EUR">EUR — Euro</option><option value="GBP">GBP — British pound</option></select><small>New sales and expenses use this currency by default.</small></label><label className="field-label">Time zone<input maxLength={100} value={form.timezone} onChange={(event) => change("timezone", event.target.value)} /><small>Use an IANA name, such as Asia/Manila.</small></label></div></section><section className="panel form-panel" id="preferences"><SectionHeading title="Preferences" subtitle="A few thoughtful nudges to help you stay ahead." /><label className="toggle-row"><span><strong>Low stock reminders</strong><small>Show inventory at or below its reorder point on your dashboard.</small></span><input type="checkbox" checked={form.lowStockEmailAlerts} onChange={(event) => change("lowStockEmailAlerts", event.target.checked)} /></label></section><div className="form-actions"><Button type="submit"><ShieldCheck size={16} /> Save settings</Button></div></div></form>}
+    {loading || !form ? <LoadingGrid /> : <form onSubmit={(event) => void save(event)} className="settings-layout">
+      <div className="settings-nav">
+        <div className="settings-tabs" role="tablist" aria-label="Workspace settings" onKeyDown={tabKeys}>
+          {(["business", "preferences"] as const).map((name) => <button key={name} type="button" role="tab" id={`settings-tab-${name}`} aria-controls={`settings-panel-${name}`} aria-selected={tab === name} tabIndex={tab === name ? 0 : -1} className={`settings-nav-item${tab === name ? " active" : ""}`} onClick={() => selectTab(name)}>{name === "business" ? "Business details" : "Preferences"}</button>)}
+        </div>
+        <Link className="settings-nav-item" to="/users">Team & access <ChevronRight size={14} /></Link>
+      </div>
+      <div className="settings-sections">
+        <section className="panel form-panel" role="tabpanel" id={`settings-panel-${tab}`} aria-labelledby={`settings-tab-${tab}`}>
+          {tab === "business" ? <><SectionHeading title="Business details" subtitle="The name and currency used across your workspace." /><div className="form-grid">
+            <label className="field-label field-span">Business name<input required maxLength={200} value={form.businessName} onChange={(event) => change("businessName", event.target.value)} /></label>
+            <label className="field-label">Default currency<select value={form.currency} onChange={(event) => change("currency", event.target.value)}><option value="PHP">PHP — Philippine peso</option><option value="USD">USD — US dollar</option><option value="SGD">SGD — Singapore dollar</option><option value="AUD">AUD — Australian dollar</option><option value="EUR">EUR — Euro</option><option value="GBP">GBP — British pound</option></select><small>New sales and expenses use this currency by default.</small></label>
+            <label className="field-label">Time zone<input required maxLength={100} value={form.timezone} onChange={(event) => change("timezone", event.target.value)} /><small>Use an IANA name, such as Asia/Manila.</small></label>
+          </div></> : <><SectionHeading title="Preferences" subtitle="A few thoughtful nudges to help you stay ahead." /><label className="toggle-row"><span><strong>Low stock reminders</strong><small>Show inventory at or below its reorder point on your dashboard.</small></span><input type="checkbox" checked={form.lowStockEmailAlerts} onChange={(event) => change("lowStockEmailAlerts", event.target.checked)} /></label></>}
+        </section>
+        <div className="form-actions"><Button type="submit" disabled={saving}><ShieldCheck size={16} />{saving ? "Saving..." : "Save settings"}</Button></div>
+      </div>
+    </form>}
   </>;
 }
 

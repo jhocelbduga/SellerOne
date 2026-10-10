@@ -262,9 +262,12 @@ export class CommerceStore {
       const currency = this.currency(body.currency);
       if (amount !== order.total_minor || currency !== order.currency) fail("Payment amount and currency must match the full order total.");
       if (this.db.prepare("SELECT 1 FROM order_payments WHERE order_id = ? AND status = 'submitted'").get(id)) fail("Review the existing payment submission first.", 409);
+      const reference = body.reference === undefined || (typeof body.reference === "string" && !body.reference.trim())
+        ? `PAY-${randomUUID().toUpperCase()}`
+        : text(body.reference, "Payment reference", 150);
       this.db.prepare(`INSERT INTO order_payments (id, order_id, method, reference, amount_minor, currency, status, created_at)
         VALUES (?, ?, ?, ?, ?, ?, 'submitted', ?)`).run(randomUUID(), id, text(body.method, "Payment method", 50),
-          text(body.reference, "Payment reference", 150), amount, currency, new Date().toISOString());
+          reference, amount, currency, new Date().toISOString());
       this.event(id, String(order.stage), "Payment reference submitted; not yet verified.", actor);
       return this.get(id);
     });
@@ -319,7 +322,9 @@ export class CommerceStore {
       }
       if (stage === "shipped") {
         const carrier = text(body.carrier, "Carrier", 100);
-        const trackingNumber = text(body.trackingNumber, "Tracking number", 150);
+        const trackingNumber = body.trackingNumber === undefined || (typeof body.trackingNumber === "string" && !body.trackingNumber.trim())
+          ? `SO-TRACK-${randomUUID().toUpperCase()}`
+          : text(body.trackingNumber, "Tracking number", 150);
         if (!order.shipping_address || !order.customer_phone) fail("A shipping address and customer phone are required before dispatch.", 409);
         this.inventory.fulfillReservation(id);
         this.db.prepare("UPDATE orders SET carrier = ?, tracking_number = ? WHERE id = ?").run(carrier, trackingNumber, id);

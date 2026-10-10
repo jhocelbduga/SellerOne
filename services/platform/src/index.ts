@@ -219,6 +219,32 @@ db.exec(`
 `);
 
 const inventory = new InventoryStore(db);
+const customerSocialFields = {
+  facebookUrl: { column: "facebook_url", label: "Facebook", hosts: ["facebook.com", "fb.com"] },
+  instagramUrl: { column: "instagram_url", label: "Instagram", hosts: ["instagram.com"] },
+  tiktokUrl: { column: "tiktok_url", label: "TikTok", hosts: ["tiktok.com"] },
+  whatsappUrl: { column: "whatsapp_url", label: "WhatsApp", hosts: ["wa.me", "whatsapp.com"] },
+  websiteUrl: { column: "website_url", label: "Website", hosts: [] },
+};
+const customerColumns = new Set(db.prepare("PRAGMA table_info(customers)").all().map((column) => String(column.name)));
+for (const { column } of Object.values(customerSocialFields)) {
+  if (!customerColumns.has(column)) db.exec(`ALTER TABLE customers ADD COLUMN ${column} TEXT`);
+}
+function customerSocialUrl(value: unknown, label: string, hosts: string[]): string | null {
+  if (value === null || (typeof value === "string" && !value.trim())) return null;
+  const input = text(value, `${label} URL`, 2000);
+  let url: URL;
+  try { url = new URL(input); }
+  catch { throw new AppError(`${label} requires a full HTTPS URL.`); }
+  if (url.protocol !== "https:" || url.username || url.password) throw new AppError(`${label} requires an HTTPS URL without embedded credentials.`);
+  if (hosts.length && !hosts.some((host) => url.hostname === host || url.hostname.endsWith(`.${host}`))) {
+    throw new AppError(`${label} URL must link to ${hosts.join(" or ")}.`);
+  }
+  return url.href;
+}
+function customerSocialResponse(row: Record<string, unknown>): Record<string, unknown> {
+  return { ...row, ...Object.fromEntries(Object.entries(customerSocialFields).map(([field, { column }]) => [field, row[column] ?? null])) };
+}
 const commerce = new CommerceStore(db, inventory);
 const publicRequests = new Map<string, { count: number; expiresAt: number }>();
 
@@ -774,6 +800,8 @@ async function api(
       sendJson(response, 200, {
         items: db.prepare(`
           SELECT c.id, c.name, c.email, c.phone, c.address, c.notes,
+            c.facebook_url AS facebookUrl, c.instagram_url AS instagramUrl, c.tiktok_url AS tiktokUrl,
+            c.whatsapp_url AS whatsappUrl, c.website_url AS websiteUrl,
             c.created_at AS createdAt, COUNT(o.id) AS orderCount,
             COALESCE(SUM(CASE WHEN o.stage IN ('delivered', 'completed') THEN o.total_minor ELSE 0 END), 0) AS spentMinor
           FROM customers c LEFT JOIN orders o ON o.customer_id = c.id
@@ -786,18 +814,23 @@ async function api(
       const body = await readBody(request);
       const id = randomBytes(16).toString("hex");
       const now = nowIso();
+      const socialValues = Object.entries(customerSocialFields).map(([field, { label, hosts }]) =>
+        body[field] === undefined ? null : customerSocialUrl(body[field], label, hosts));
       db.prepare(`
-        INSERT INTO customers (id, name, email, phone, address, notes, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO customers (id, name, email, phone, address, notes, created_at, updated_at,
+          facebook_url, instagram_url, tiktok_url, whatsapp_url, website_url)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(id, text(body.name, "Name"), optionalText(body.email, "Email", 254)?.toLowerCase() ?? null,
         optionalText(body.phone, "Phone", 50), optionalText(body.address, "Address"),
-        optionalText(body.notes, "Notes"), now, now);
-      sendJson(response, 201, db.prepare("SELECT * FROM customers WHERE id = ?").get(id));
+        optionalText(body.notes, "Notes"), now, now, ...socialValues);
+      sendJson(response, 201, customerSocialResponse(db.prepare("SELECT * FROM customers WHERE id = ?").get(id)!));
       return;
     }
     if (path.length === 2 && method === "GET") {
       const customer = db.prepare(`
         SELECT c.id, c.name, c.email, c.phone, c.address, c.notes, c.created_at AS createdAt,
+          c.facebook_url AS facebookUrl, c.instagram_url AS instagramUrl, c.tiktok_url AS tiktokUrl,
+          c.whatsapp_url AS whatsappUrl, c.website_url AS websiteUrl,
           COUNT(o.id) AS orderCount,
           COALESCE(SUM(CASE WHEN o.stage IN ('delivered', 'completed') THEN o.total_minor ELSE 0 END), 0) AS spentMinor
         FROM customers c LEFT JOIN orders o ON o.customer_id = c.id
@@ -832,6 +865,12 @@ async function api(
             ? text(body[field], "Name")
             : optionalText(body[field], field === "email" ? "Email" : field)?.toLowerCase() ?? null);
         }
+        for (const [field, { column, label, hosts }] of Object.entries(customerSocialFields)) {
+          if (body[field] !== undefined) {
+            fields.push(`${column} = ?`);
+            values.push(customerSocialUrl(body[field], label, hosts));
+          }
+        }
       }
       if (fields.length === 0) {
         throw new AppError("Provide at least one customer field to update.");
@@ -839,7 +878,7 @@ async function api(
       fields.push("updated_at = ?");
       values.push(nowIso(), path[1]);
       db.prepare(`UPDATE customers SET ${fields.join(", ")} WHERE id = ?`).run(...values);
-      sendJson(response, 200, db.prepare("SELECT * FROM customers WHERE id = ?").get(path[1]));
+      sendJson(response, 200, customerSocialResponse(db.prepare("SELECT * FROM customers WHERE id = ?").get(path[1])!));
       return;
     }
   }
@@ -899,7 +938,7 @@ async function api(
     if (path.length === 1 && method === "GET") {
       sendJson(response, 200, {
         items: db.prepare(`
-          SELECT id, customer_id AS customerId, customer_name AS customerName,
+          SELECT id, order_id AS orderId, customer_id AS customerId, customer_name AS customerName,
             description, amount_minor AS amountMinor, currency, channel, created_at AS createdAt
           FROM sales ORDER BY created_at DESC LIMIT 500
         `).all(),
@@ -984,19 +1023,40 @@ async function api(
 
   if (path[0] === "reports" && method === "GET") {
     const currency = setting("currency", DEFAULT_CURRENCY);
-    const sales = db.prepare(`
-      SELECT substr(created_at, 1, 10) AS day, currency, SUM(amount_minor) AS amountMinor, COUNT(*) AS transactionCount
-      FROM sales WHERE currency = ? GROUP BY day ORDER BY day DESC LIMIT 90
-    `).all(currency);
-    const expenses = db.prepare(`
-      SELECT category, currency, SUM(amount_minor) AS amountMinor, COUNT(*) AS transactionCount
-      FROM expenses WHERE currency = ? GROUP BY category ORDER BY amountMinor DESC
-    `).all(currency);
+    const timezone = setting("timezone", "Asia/Manila");
+    const formatter = new Intl.DateTimeFormat("en-CA", { timeZone: timezone, year: "numeric", month: "2-digit", day: "2-digit" });
+    const calendarDay = (timestamp: string): string => {
+      const parts = formatter.formatToParts(new Date(timestamp));
+      return ["year", "month", "day"].map((type) => parts.find((part) => part.type === type)!.value).join("-");
+    };
+    const endDay = calendarDay(nowIso());
+    const startDate = new Date(`${endDay}T00:00:00.000Z`);
+    startDate.setUTCDate(startDate.getUTCDate() - 89);
+    const startDay = startDate.toISOString().slice(0, 10);
+    const lowerBound = new Date(startDate.getTime() - 86400000).toISOString();
+    const upperBound = new Date(new Date(`${endDay}T00:00:00.000Z`).getTime() + 2 * 86400000).toISOString();
+    const groupTransactions = (table: "sales" | "expenses") => {
+      const groups = new Map<string, { day?: string; category?: string; currency: string; amountMinor: number; transactionCount: number }>();
+      const rows = db.prepare(`SELECT created_at, amount_minor${table === "expenses" ? ", category" : ""}
+        FROM ${table} WHERE currency = ? AND created_at >= ? AND created_at < ?`).all(currency, lowerBound, upperBound);
+      for (const row of rows) {
+        const day = calendarDay(String(row.created_at));
+        if (day < startDay || day > endDay) continue;
+        const key = table === "sales" ? day : String(row.category);
+        const group = groups.get(key) ?? { ...(table === "sales" ? { day } : { category: key }), currency, amountMinor: 0, transactionCount: 0 };
+        group.amountMinor += Number(row.amount_minor);
+        group.transactionCount++;
+        groups.set(key, group);
+      }
+      return [...groups.values()];
+    };
+    const sales = groupTransactions("sales").sort((a, b) => String(b.day).localeCompare(String(a.day)));
+    const expenses = groupTransactions("expenses").sort((a, b) => b.amountMinor - a.amountMinor);
     const orders = db.prepare(`
       SELECT stage AS status, currency, COUNT(*) AS count, SUM(total_minor) AS amountMinor
       FROM orders WHERE currency = ? GROUP BY stage ORDER BY stage
     `).all(currency);
-    sendJson(response, 200, { currency, sales, expenses, orders });
+    sendJson(response, 200, { currency, timezone, startDay, endDay, sales, expenses, orders });
     return;
   }
 

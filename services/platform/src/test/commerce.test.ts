@@ -104,6 +104,50 @@ before(async () => {
 after(async () => { await stop(); rmSync(directory, { recursive: true, force: true }); });
 
 describe("social commerce platform", () => {
+  it("saves customer-specific social links with domain validation, removal and restart persistence", async () => {
+    const links = {
+      facebookUrl: "https://www.facebook.com/fictional.customer",
+      instagramUrl: "https://www.instagram.com/fictional.customer",
+      tiktokUrl: "https://www.tiktok.com/@fictional.customer",
+      whatsappUrl: "https://wa.me/12025550101",
+      websiteUrl: "https://example.test/profile",
+    };
+    const created = await request("/customers", "POST", { name: "Social test customer", email: "social@example.test", ...links });
+    assert.equal(created.status, 201);
+    const customerPath = `/customers/${created.body.id}`;
+    for (const [key, value] of Object.entries(links)) assert.equal(created.body[key], value);
+    const second = await request("/customers", "POST", { name: "Unlinked customer" });
+    assert.equal(second.status, 201);
+    assert.equal(second.body.facebookUrl, null);
+    assert.equal((await request(customerPath, "PATCH", { facebookUrl: "https://facebook.com/changed" }, "")).status, 401);
+    for (const facebookUrl of ["javascript:alert(1)", "http://facebook.com/test", "https://facebook.com.example.test/test", "https://user:password@facebook.com/test", 123, "x".repeat(2001)]) {
+      assert.equal((await request(customerPath, "PATCH", { facebookUrl, name: "Invalid change" })).status, 400);
+    }
+    assert.equal((await request(customerPath)).body.name, "Social test customer");
+    assert.equal((await request(customerPath)).body.facebookUrl, links.facebookUrl);
+    assert.equal((await request("/customers", "POST", { name: "Invalid new customer", instagramUrl: "https://tiktok.com/wrong" })).status, 400);
+    const updated = await request(customerPath, "PATCH", { facebookUrl: "  https://facebook.com/changed  ", instagramUrl: "", tiktokUrl: null, whatsappUrl: "   " });
+    assert.equal(updated.status, 200);
+    assert.equal(updated.body.facebookUrl, "https://facebook.com/changed");
+    assert.equal(updated.body.instagramUrl, null);
+    assert.equal(updated.body.tiktokUrl, null);
+    assert.equal(updated.body.whatsappUrl, null);
+    assert.equal(updated.body.websiteUrl, links.websiteUrl);
+    assert.equal((await request(`/customers/${second.body.id}`)).body.facebookUrl, null);
+    const listed = ((await request("/customers")).body.items as Row[]).find((row) => row.id === created.body.id);
+    assert.equal(listed?.facebookUrl, "https://facebook.com/changed");
+    await stop();
+    await start();
+    const restored = (await request(customerPath)).body;
+    assert.equal(restored.facebookUrl, "https://facebook.com/changed");
+    assert.equal(restored.websiteUrl, links.websiteUrl);
+    const captured = await order(await product(), 1, { customerId: created.body.id });
+    const publicTracking = await request(`/public/tracking/${String(captured.trackingPath).split("/").at(-1)}`, "GET", undefined, "");
+    assert.equal(publicTracking.status, 200);
+    assert.equal(JSON.stringify(publicTracking.body).includes("facebook.com/changed"), false);
+    assert.equal(JSON.stringify(publicTracking.body).includes("example.test/profile"), false);
+  });
+
   it("processes received through completed with one FIFO deduction and one sale", async () => {
     const variantId = await product();
     const created = await order(variantId);
@@ -125,18 +169,22 @@ describe("social commerce platform", () => {
     assert.equal(reserved.quantityAvailable, 8);
     assert.equal((await request(`/orders/${created.id}/verify-payment`, "POST", { paymentId })).status, 409);
     assert.equal((await request(`/orders/${created.id}`, "PATCH", { stage: "packing" })).status, 200);
-    const dispatch = { stage: "shipped", carrier: "Test courier", trackingNumber: "TRACK-1" };
-    assert.equal((await request(`/orders/${created.id}`, "PATCH", dispatch)).status, 200);
+    const dispatch = { stage: "shipped", carrier: "Test courier", trackingNumber: "  TRACK-1  " };
+    const dispatched = await request(`/orders/${created.id}`, "PATCH", dispatch);
+    assert.equal(dispatched.status, 200);
+    assert.equal(dispatched.body.trackingNumber, "TRACK-1");
     assert.equal((await request(`/orders/${created.id}`, "PATCH", dispatch)).status, 200);
     const deducted = await balance(variantId);
     assert.equal(deducted.quantityOnHand, 8);
     assert.equal(deducted.quantityReserved, 0);
     assert.equal((await request(`/orders/${created.id}`, "PATCH", { stage: "cancelled" })).status, 409);
     assert.equal((await request(`/orders/${created.id}`, "PATCH", { stage: "delivered" })).status, 200);
+    assert.equal(((await request("/sales")).body.items as Row[]).filter((sale) => sale.orderId === created.id).length, 0);
     assert.equal((await request(`/orders/${created.id}`, "PATCH", { stage: "completed" })).status, 200);
     assert.equal((await request(`/orders/${created.id}`, "PATCH", { stage: "completed" })).status, 200);
     const sales = ((await request("/sales")).body.items as Row[]).filter((sale) => String(sale.description).includes(String(created.orderNumber)));
     assert.equal(sales.length, 1);
+    assert.equal(sales[0].orderId, created.id);
     assert.equal(sales[0].amountMinor, 1000);
     assert.equal((await request(`/customers/${created.customerId}`)).body.spentMinor, 1000);
     assert.ok(((await request("/reports")).body.orders as Row[]).some((row) => row.status === "completed"));
@@ -145,6 +193,15 @@ describe("social commerce platform", () => {
     assert.equal(movements[0].totalCostMinor, 200);
     const completed = (await request(`/orders/${created.id}`)).body;
     assert.deepEqual((completed.timeline as Row[]).map((event) => event.stage), ["received", "received", "payment_verified", "packing", "shipped", "delivered", "completed"]);
+  });
+
+  it("lists manual sales without a linked order", async () => {
+    const saved = await request("/sales", "POST", { customerName: "Fictional Walk-in", description: "Manual test sale", amountMinor: 250, currency: "PHP", channel: "Manual" });
+    assert.equal(saved.status, 201);
+    const entry = ((await request("/sales")).body.items as Row[]).find((sale) => sale.id === saved.body.id);
+    assert.ok(entry);
+    assert.equal(entry.orderId, null);
+    assert.equal(entry.amountMinor, 250);
   });
 
   it("rejects invalid payments and enforces owner/admin verification", async () => {
@@ -160,6 +217,52 @@ describe("social commerce platform", () => {
     assert.equal((resubmit.body.payments as Row[]).length, 2);
     assert.equal((await request("/orders/import", "POST", {}, staffCookie)).status, 403);
     assert.equal((await request("/checkout-links", "GET", undefined, staffCookie)).status, 403);
+  });
+
+  it("generates persistent unique payment references when blank and preserves manual references", async () => {
+    const variantId = await product();
+    const references: string[] = [];
+    for (const reference of [undefined, "", "   "]) {
+      const created = await order(variantId);
+      const result = await request(`/orders/${created.id}/payments`, "POST", {
+        method: "Cash", reference, amountMinor: created.totalMinor, currency: "PHP",
+      });
+      assert.equal(result.status, 200);
+      const submitted = (result.body.payments as Row[])[0];
+      assert.match(String(submitted.reference), /^PAY-[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$/);
+      assert.equal(submitted.status, "submitted");
+      assert.equal(result.body.stage, "received");
+      references.push(String(submitted.reference));
+      const reread = (await request(`/orders/${created.id}`)).body;
+      assert.equal((reread.payments as Row[])[0].reference, submitted.reference);
+      assert.equal((await request(`/orders/${created.id}/payments`, "POST", {
+        method: "Cash", amountMinor: created.totalMinor, currency: "PHP",
+      })).status, 409);
+    }
+    assert.equal(new Set(references).size, 3);
+    const manual = await order(variantId);
+    const preserved = await request(`/orders/${manual.id}/payments`, "POST", {
+      method: "Bank transfer", reference: "  REAL-TRANSACTION-001  ", amountMinor: manual.totalMinor, currency: "PHP",
+    });
+    assert.equal((preserved.body.payments as Row[])[0].reference, "REAL-TRANSACTION-001");
+    const publicOrder = await order(variantId);
+    const token = String(publicOrder.trackingPath).split("/").at(-1);
+    const publicResult = await request(`/public/tracking/${token}/payments`, "POST", {
+      method: "GCash", reference: "", amountMinor: publicOrder.totalMinor, currency: "PHP",
+    }, "");
+    assert.equal(publicResult.status, 201);
+    assert.equal(publicResult.body.paymentStatus, "submitted");
+    assert.ok(!JSON.stringify(publicResult.body).includes("PAY-"));
+    const privateResult = (await request(`/orders/${publicOrder.id}`)).body;
+    assert.match(String((privateResult.payments as Row[])[0].reference), /^PAY-/);
+    const invalidOrder = await order(variantId);
+    for (const reference of [null, 123, "x".repeat(151)]) {
+      assert.equal((await request(`/orders/${invalidOrder.id}/payments`, "POST", {
+        method: "Cash", reference, amountMinor: invalidOrder.totalMinor, currency: "PHP",
+      })).status, 400);
+    }
+    assert.equal(((await request(`/orders/${invalidOrder.id}`)).body.payments as Row[]).length, 0);
+    assert.equal((await balance(variantId)).quantityReserved, 0);
   });
 
   it("reserves atomically across competing orders and blocks manual reserved-stock consumption", async () => {
@@ -315,12 +418,50 @@ describe("social commerce platform", () => {
     const paymentId = await payment(created);
     await request(`/orders/${created.id}/verify-payment`, "POST", { paymentId });
     await request(`/orders/${created.id}`, "PATCH", { stage: "packing" });
-    assert.equal((await request(`/orders/${created.id}`, "PATCH", { stage: "shipped", carrier: "Courier", trackingNumber: "SHIP-1" })).status, 409);
+    assert.equal((await request(`/orders/${created.id}`, "PATCH", { stage: "shipped", carrier: "Courier" })).status, 409);
+    assert.equal((await request(`/orders/${created.id}`)).body.trackingNumber, null);
     assert.equal((await balance(variantId)).quantityReserved, 2);
     assert.equal((await balance(variantId)).quantityOnHand, 10);
     assert.equal((await request(`/orders/${created.id}/shipping`, "POST", { customerPhone: "09123456789", shippingAddress: "Updated address" })).status, 200);
     assert.equal((await request(`/orders/${created.id}`, "PATCH", { stage: "shipped", carrier: "Courier", trackingNumber: "SHIP-1" })).status, 200);
     assert.equal((await request(`/orders/${created.id}/shipping`, "POST", { customerPhone: "09123456789", shippingAddress: "Changed address" })).status, 409);
+  });
+
+  it("generates unique shipment numbers on dispatch, validates input and preserves retries", async () => {
+    const numbers: string[] = [];
+    for (const trackingNumber of [undefined, "", "   "]) {
+      const variantId = await product();
+      const created = await order(variantId);
+      const paymentId = await payment(created);
+      assert.equal((await request(`/orders/${created.id}/verify-payment`, "POST", { paymentId })).status, 200);
+      assert.equal((await request(`/orders/${created.id}`, "PATCH", { stage: "packing" })).status, 200);
+      assert.equal((await request(`/orders/${created.id}`)).body.trackingNumber, null);
+      for (const invalid of [null, 123, "X".repeat(151)]) {
+        assert.equal((await request(`/orders/${created.id}`, "PATCH", { stage: "shipped", carrier: "J&T Express", trackingNumber: invalid })).status, 400);
+      }
+      assert.equal((await request(`/orders/${created.id}`, "PATCH", { stage: "shipped", carrier: "" })).status, 400);
+      assert.equal((await balance(variantId)).quantityOnHand, 10);
+      assert.equal((await balance(variantId)).quantityReserved, 2);
+      const dispatched = await request(`/orders/${created.id}`, "PATCH", { stage: "shipped", carrier: "J&T Express", trackingNumber });
+      assert.equal(dispatched.status, 200);
+      assert.equal(dispatched.body.stage, "shipped");
+      assert.equal(dispatched.body.carrier, "J&T Express");
+      const generated = String(dispatched.body.trackingNumber);
+      assert.match(generated, /^SO-TRACK-[0-9A-F]{8}-[0-9A-F]{4}-4[0-9A-F]{3}-[89AB][0-9A-F]{3}-[0-9A-F]{12}$/);
+      numbers.push(generated);
+      assert.equal((await request(`/orders/${created.id}`)).body.trackingNumber, generated);
+      const retry = await request(`/orders/${created.id}`, "PATCH", { stage: "shipped", carrier: "Different carrier", trackingNumber: "REPLACEMENT" });
+      assert.equal(retry.status, 200);
+      assert.equal(retry.body.trackingNumber, generated);
+      assert.equal(retry.body.carrier, "J&T Express");
+      assert.equal((await balance(variantId)).quantityOnHand, 8);
+      assert.equal((await balance(variantId)).quantityReserved, 0);
+      const tracked = await request(`/public/tracking/${String(created.trackingPath).split("/").at(-1)}`, "GET", undefined, "");
+      assert.equal(tracked.status, 200);
+      assert.equal(tracked.body.trackingNumber, generated);
+      assert.equal(tracked.body.carrier, "J&T Express");
+    }
+    assert.equal(new Set(numbers).size, 3);
   });
 
   it("filters across all orders with stable pagination rather than truncating the inbox", async () => {
@@ -340,11 +481,55 @@ describe("social commerce platform", () => {
     assert.equal((await request("/orders?stage=invalid")).status, 400);
   });
 
+  it("reports exactly 90 calendar days in the workspace timezone with matching expense totals", async () => {
+    const before = (await request("/reports")).body;
+    assert.equal(before.timezone, "Asia/Manila");
+    const startTime = new Date(`${before.startDay}T00:00:00+08:00`).getTime();
+    const end = new Date(`${before.endDay}T00:00:00+08:00`).getTime() + 86400000;
+    assert.equal(end - startTime, 90 * 86400000);
+    await stop();
+    const db = new DatabaseSync(databasePath);
+    try {
+      const sale = db.prepare(`INSERT INTO sales (id, customer_name, description, amount_minor, currency, channel, created_at)
+        VALUES (?, 'Report fixture', 'Report fixture', ?, ?, 'Manual', ?)`);
+      const expense = db.prepare(`INSERT INTO expenses (id, description, category, amount_minor, currency, created_at)
+        VALUES (?, 'Report fixture', 'Report boundary test', ?, 'PHP', ?)`);
+      for (const [index, timestamp, amount] of [[0, startTime - 1, 10000], [1, startTime, 100], [2, startTime + 86400000 - 1, 200], [3, end - 1, 300], [4, end, 20000]]) {
+        const date = new Date(timestamp).toISOString();
+        sale.run(`report-sale-${index}`, amount, "PHP", date);
+        expense.run(`report-expense-${index}`, amount, date);
+      }
+      sale.run("report-foreign-currency", 99999, "USD", new Date(startTime).toISOString());
+    } finally { db.close(); }
+    await start();
+    const report = (await request("/reports")).body;
+    const previousSales = before.sales as Row[];
+    const sales = report.sales as Row[];
+    const total = (rows: Row[]) => rows.reduce((sum, row) => sum + Number(row.amountMinor), 0);
+    assert.equal(total(sales) - total(previousSales), 600);
+    const firstDay = sales.find((row) => row.day === before.startDay);
+    assert.ok(firstDay);
+    assert.equal(Number(firstDay.amountMinor) - Number(previousSales.find((row) => row.day === before.startDay)?.amountMinor ?? 0), 300);
+    assert.equal(Number(firstDay.transactionCount) - Number(previousSales.find((row) => row.day === before.startDay)?.transactionCount ?? 0), 2);
+    assert.ok(sales.every((row) => String(row.day) >= String(report.startDay) && String(row.day) <= String(report.endDay)));
+    const expenses = report.expenses as Row[];
+    const boundaryExpenses = expenses.find((row) => row.category === "Report boundary test");
+    assert.ok(boundaryExpenses);
+    assert.equal(boundaryExpenses.amountMinor, 600);
+    assert.equal(boundaryExpenses.transactionCount, 3);
+  });
+
   it("persists workflow and reservations across restart and migrates legacy statuses", async () => {
     const variantId = await product();
     const created = await order(variantId);
     const paymentId = await payment(created);
     await request(`/orders/${created.id}/verify-payment`, "POST", { paymentId });
+    const shipment = await order(variantId, 1);
+    const shipmentPayment = await payment(shipment);
+    assert.equal((await request(`/orders/${shipment.id}/verify-payment`, "POST", { paymentId: shipmentPayment })).status, 200);
+    assert.equal((await request(`/orders/${shipment.id}`, "PATCH", { stage: "packing" })).status, 200);
+    const dispatched = await request(`/orders/${shipment.id}`, "PATCH", { stage: "shipped", carrier: "Custom courier" });
+    assert.equal(dispatched.status, 200);
     await stop();
     const db = new DatabaseSync(databasePath);
     try {
@@ -357,6 +542,10 @@ describe("social commerce platform", () => {
     assert.equal(restored.stage, "payment_verified");
     assert.equal((restored.payments as Row[])[0].status, "verified");
     assert.equal((await balance(variantId)).quantityReserved, 2);
+    const restoredShipment = (await request(`/orders/${shipment.id}`)).body;
+    assert.equal(restoredShipment.stage, "shipped");
+    assert.equal(restoredShipment.trackingNumber, dispatched.body.trackingNumber);
+    assert.equal(restoredShipment.carrier, "Custom courier");
     const legacy = (await request("/orders/legacy-order")).body;
     assert.equal(legacy.stage, "received");
     assert.equal(legacy.trackingPath, null);

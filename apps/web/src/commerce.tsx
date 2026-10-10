@@ -3,6 +3,7 @@ import { Link, useNavigate, useParams } from "react-router-dom";
 import { api, dateLabel, money, useLoad } from "./api";
 
 const channels = ["Manual", "TikTok Shop", "Facebook Marketplace", "Facebook Page", "Facebook Messenger", "Instagram", "Shareable Order Link"];
+const carriers = ["J&T Express", "JRS Express", "LBC Express", "Ninja Van", "Flash Express", "SPX Express", "GoGo Xpress", "GrabExpress", "Lalamove"];
 const stages = ["received", "payment_verified", "packing", "shipped", "delivered", "completed", "cancelled"];
 interface Variant { id: string; name: string; sku: string; uom: string; currency: string; active: boolean }
 interface Product { id: string; name: string; active: boolean; variants: Variant[] }
@@ -30,8 +31,8 @@ function label(value: string): string { return value.replaceAll("_", " ").replac
 function ErrorBox({ message }: { message: string }): React.JSX.Element | null {
   return message ? <div className="error-box" role="alert">{message}</div> : null;
 }
-function Panel({ title, children }: { title: string; children: React.ReactNode }): React.JSX.Element {
-  return <section className="panel commerce-panel"><h2>{title}</h2>{children}</section>;
+function Panel({ title, children, className = "" }: { title: string; children: React.ReactNode; className?: string }): React.JSX.Element {
+  return <section className={`panel commerce-panel ${className}`}><h2>{title}</h2>{children}</section>;
 }
 function Heading({ title, children }: { title: string; children?: React.ReactNode }): React.JSX.Element {
   return <div className="page-heading"><div><span className="page-eyebrow">SOCIAL COMMERCE</span><h1>{title}</h1></div><div className="button-group">{children}</div></div>;
@@ -58,9 +59,27 @@ function PaymentForm({ totalMinor, currency, submit, busy }: { totalMinor: numbe
     void submit({ method: form.get("method"), reference: form.get("reference"), amountMinor: totalMinor, currency });
   }}><p>Full amount: <strong>{money(totalMinor, currency)}</strong>. A reference is not proof of payment; the seller must verify it independently.</p>
     <label className="field-label">Payment method<select name="method"><option>Bank transfer</option><option>GCash</option><option>Maya</option><option>Cash</option></select></label>
-    <label className="field-label">Payment reference<input name="reference" required maxLength={150} placeholder="Transaction ID / cash receipt number" /></label>
+    <label className="field-label">Payment reference <span className="field-optional">AUTOMATIC IF BLANK</span><input name="reference" maxLength={150} placeholder="Enter transaction ID / cash receipt number, or leave blank" /><small>A unique SellerOne reference is generated on submission if blank. It is not a bank transaction ID, proof of payment, or an official cash receipt.</small></label>
     <button className="button button-primary" disabled={busy}>Submit payment reference</button>
   </form>;
+}
+function ShipmentForm({ submit, busy }: { submit: (body: Record<string, unknown>) => Promise<void>; busy: boolean }): React.JSX.Element {
+  const [carrier, setCarrier] = useState("");
+  return <form className="modal-form" onSubmit={(event) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    void submit({ stage: "shipped", carrier: carrier === "custom" ? form.get("customCarrier") : carrier, trackingNumber: form.get("trackingNumber") });
+  }}>
+    <label className="field-label">Carrier<select name="carrier" required value={carrier} onChange={(event) => setCarrier(event.target.value)}>
+      <option value="" disabled>Select a carrier</option>{carriers.map((name) => <option key={name}>{name}</option>)}<option value="custom">Custom carrier</option>
+    </select></label>
+    {carrier === "custom" && <label className="field-label">Custom carrier name<input name="customCarrier" required maxLength={100} /></label>}
+    <label className="field-label">Tracking number <span className="field-optional">AUTOMATIC IF BLANK</span><input name="trackingNumber" maxLength={150} placeholder="Enter courier tracking number, or leave blank" /><small>Dispatch generates a unique internal SellerOne number if blank. It is not a courier-issued tracking number and cannot track a parcel on the courier's website.</small></label>
+    <button className="button button-primary" disabled={busy}>Dispatch shipment</button>
+  </form>;
+}
+function ShipmentDetails({ carrier, trackingNumber }: { carrier?: string; trackingNumber?: string }): React.JSX.Element | null {
+  return carrier ? <div><p>Carrier: {carrier} · Tracking number: {trackingNumber}</p>{trackingNumber?.startsWith("SO-TRACK-") && <small>Internal SellerOne tracking number; not valid on the courier's website.</small>}</div> : null;
 }
 function CustomerFields({ required = false }: { required?: boolean }): React.JSX.Element {
   return <div className="form-grid">
@@ -184,21 +203,24 @@ export function CommerceOrderDetails({ role }: { role: string }): React.JSX.Elem
   if (order.loading) return <p>Loading order...</p>;
   if (!order.data) return <ErrorBox message={order.error || "Order unavailable."} />;
   const data = order.data;
+  const completed = data.stage === "completed";
   const next: Record<string, string> = { payment_verified: "packing", shipped: "delivered", delivered: "completed" };
   const canCancel = ["received", "payment_verified", "packing"].includes(data.stage);
   const pendingPayment = data.payments.find((payment) => payment.status === "submitted");
-  return <>
+  return <div className="commerce-order-details">
     <Link className="back-link" to="/orders">Back to orders</Link>
-    <Heading title="Order details"><button className="button button-secondary" onClick={() => window.print()}>Print invoice</button></Heading>
+    <Heading title="Order details"><button className="button button-secondary" disabled={!completed || busy || !!order.error} title={completed ? "Preview and print the completed invoice" : "Mark the delivered order completed to enable invoice printing"} onClick={() => window.print()}>Print invoice</button></Heading>
+    {!completed && <p className="commerce-no-print">Invoice printing is available after the order is marked completed.</p>}
     <ErrorBox message={order.error || error} />{notice && <div className="success-box" role="status">{notice}</div>}
-    <Panel title={`Invoice ${data.invoiceNumber}`}><strong>{data.businessName}</strong><p className="mono">{data.orderNumber}</p><p>{data.customerName} · {data.channel}{data.externalId ? ` · ${data.externalId}` : ""}</p><p>{data.customerEmail} {data.customerPhone}</p><p>{data.shippingAddress || "No shipping address yet"}</p>{data.customerId && <Link className="inline-link commerce-no-print" to={`/customers/${data.customerId}`}>View customer profile</Link>}<Items items={data.items} currency={data.currency} /><div className="order-total"><span>Total</span><strong>{money(data.totalMinor, data.currency)}</strong></div><p>Stage: <strong>{label(data.stage)}</strong>. Payment: <strong>{data.refundDue ? "Refund due" : label(data.payments.at(-1)?.status ?? "unpaid")}</strong></p></Panel>
+    <Panel className="commerce-invoice" title={`Invoice ${data.invoiceNumber}`}><strong>{data.businessName}</strong><p>Issued: {dateLabel(data.createdAt)}</p><p className="mono">{data.orderNumber}</p><p>{data.customerName} · {data.channel}{data.externalId ? ` · ${data.externalId}` : ""}</p><p>{data.customerEmail} {data.customerPhone}</p><p>{data.shippingAddress || "No shipping address yet"}</p>{data.customerId && <Link className="inline-link commerce-no-print" to={`/customers/${data.customerId}`}>View customer profile</Link>}<Items items={data.items} currency={data.currency} /><div className="order-total"><span>Total</span><strong>{money(data.totalMinor, data.currency)}</strong></div><p>Stage: <strong>{label(data.stage)}</strong>. Payment: <strong>{data.refundDue ? "Refund due" : label(data.payments.at(-1)?.status ?? "unpaid")}</strong></p></Panel>
     <div className="detail-grid commerce-no-print"><div>
       <Panel title="Workflow"><p>Received → payment verified + stock reserved → packing → shipped + stock deducted → delivered → completed + sale recorded.</p><div className="button-group">
         {next[data.stage] && <button className="button button-primary" disabled={busy} onClick={() => void run("", { stage: next[data.stage] }, "PATCH")}>Mark {label(next[data.stage])}</button>}
+        {completed && <button className="button button-primary" disabled>Mark Completed</button>}
         {canCancel && <button className="button button-secondary" disabled={busy} onClick={() => { if (window.confirm("Cancel this order and release its reserved stock? A verified payment will require a manual refund.")) void run("", { stage: "cancelled" }, "PATCH"); }}>Cancel order</button>}
       </div>
-      {data.stage === "packing" && <form className="modal-form" onSubmit={(event) => { event.preventDefault(); void run("", { ...Object.fromEntries(new FormData(event.currentTarget)), stage: "shipped" }, "PATCH"); }}><label className="field-label">Carrier<input name="carrier" required maxLength={100} /></label><label className="field-label">Tracking number<input name="trackingNumber" required maxLength={150} /></label><button className="button button-primary" disabled={busy}>Dispatch shipment</button></form>}
-      {data.carrier && <p>Carrier: {data.carrier} · Tracking: {data.trackingNumber}</p>}
+      {data.stage === "packing" && <ShipmentForm busy={busy} submit={(body) => run("", body, "PATCH")} />}
+      <ShipmentDetails carrier={data.carrier} trackingNumber={data.trackingNumber} />
       {canCancel && <><button className="button button-secondary" onClick={() => setShipping(!shipping)}>Edit shipping details</button>{shipping && <form className="modal-form" onSubmit={(event) => fromForm(event, "shipping")}><label className="field-label">Customer phone<input name="customerPhone" defaultValue={data.customerPhone} required maxLength={50} /></label><label className="field-label">Shipping address<textarea name="shippingAddress" defaultValue={data.shippingAddress} required maxLength={1000} /></label><button className="button button-primary" disabled={busy}>Save shipping details</button></form>}</>}
       </Panel>
       <Panel title="Payment validation">{data.payments.map((payment) => <article className="commerce-link-card" key={payment.id}><strong>{payment.method} · {payment.reference}</strong><p>{money(payment.amountMinor, payment.currency)} · {label(payment.status)}</p>{payment.reviewNote && <p>{payment.reviewNote}</p>}</article>)}
@@ -213,7 +235,7 @@ export function CommerceOrderDetails({ role }: { role: string }): React.JSX.Elem
         {data.communications.map((message) => <article className="commerce-link-card" key={message.id}><strong>{label(message.status ?? "")}</strong><p>{message.message}</p><small>{dateLabel(message.createdAt)} · {message.actor}</small></article>)}
       </Panel>
     </div><div><Panel title="Order timeline"><Timeline events={data.timeline} /></Panel>{data.notes && <Panel title="Internal notes"><p>{data.notes}</p></Panel>}</div></div>
-  </>;
+  </div>;
 }
 
 export function CheckoutPage(): React.JSX.Element {
@@ -257,7 +279,7 @@ export function TrackingPage(): React.JSX.Element {
   };
   const data = tracking.data;
   return <main className="commerce-public"><Heading title="Track your order"><button className="button button-secondary" onClick={tracking.reload}>Refresh status</button></Heading><p>This private link provides order updates. Keep it confidential.</p><ErrorBox message={tracking.error || error} />
-    {tracking.loading ? <p>Loading status...</p> : data && <><Panel title={data.orderNumber}><p>Order: <strong>{label(data.stage)}</strong> · Payment: <strong>{data.refundDue ? "Refund due" : label(data.paymentStatus)}</strong></p><Items items={data.items} currency={data.currency} /><strong>Total: {money(data.totalMinor, data.currency)}</strong>{data.carrier && <p>Carrier: {data.carrier} · Tracking number: {data.trackingNumber}</p>}</Panel>
+    {tracking.loading ? <p>Loading status...</p> : data && <><Panel title={data.orderNumber}><p>Order: <strong>{label(data.stage)}</strong> · Payment: <strong>{data.refundDue ? "Refund due" : label(data.paymentStatus)}</strong></p><Items items={data.items} currency={data.currency} /><strong>Total: {money(data.totalMinor, data.currency)}</strong><ShipmentDetails carrier={data.carrier} trackingNumber={data.trackingNumber} /></Panel>
       {data.stage === "received" && ["unpaid", "rejected"].includes(data.paymentStatus) && <Panel title="Submit payment reference"><p>Contact your seller for payment instructions. Do not pay until the seller confirms the correct payment destination.</p><PaymentForm totalMinor={data.totalMinor} currency={data.currency} busy={busy} submit={submit} /></Panel>}
       <Panel title="Order progress"><Timeline events={data.timeline} /></Panel>
       {data.messages.length > 0 && <Panel title="Seller messages">{data.messages.map((message) => <article className="commerce-link-card" key={message.id}><p>{message.message}</p><small>{dateLabel(message.createdAt)}</small></article>)}</Panel>}

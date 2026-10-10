@@ -448,15 +448,70 @@ log, and an ordered audit timeline.
 1. **Received**: awaiting payment; no stock is reserved yet.
 2. Submit a full-amount payment reference. The seller must independently check
    the funds. A reference alone never marks an order paid.
+   Leave the reference blank to generate a unique `PAY-<uppercase UUID>`
+   SellerOne submission reference, or enter a real transaction ID/cash receipt
+   number to preserve it. The server generates references for omitted, empty,
+   or whitespace-only strings in both seller and customer submissions.
+   Generated references are internal identifiers, not provider transaction IDs,
+   proof of payment, or official cash receipts. They appear in the seller's
+   payment records; public tracking continues to hide payment references.
 3. An **owner/admin** verifies payment and reserves stock in one SQLite
    transaction. Insufficient stock rolls back both verification and all line
    reservations. Staff cannot approve, reject, or record refunds.
 4. **Packing**: reserved stock remains physically on hand.
-5. **Shipped**: enter carrier/tracking number; phone and delivery address are
-   required. All reserved items are deducted using FIFO in the same transaction
-   as the stage change. Retry does not double-deduct stock.
+5. **Shipped**: select J&T Express, JRS Express, LBC Express, Ninja Van,
+   Flash Express, SPX Express, GoGo Xpress, GrabExpress, Lalamove, or a custom
+   carrier. Enter a courier-issued tracking number to preserve it, or leave it
+   blank to generate a unique `SO-TRACK-<uppercase UUID>` on **Dispatch shipment**.
+   Omitted, empty, and whitespace-only tracking numbers generate an internal
+   SellerOne identifier, not a courier-issued number; it cannot track a parcel
+   on the courier's website. Seller and customer tracking show the saved number.
+   Phone and delivery address are required. All reserved items are deducted
+   using FIFO in the same transaction as the stage change and saved shipment.
+   Retry preserves the number and does not double-deduct stock.
 6. **Delivered**: seller records delivery confirmation manually.
 7. **Completed**: creates one linked sales entry; retries do not duplicate it.
+   The Sales table includes a **View order / invoice** link for these entries.
+   Manually recorded sales are labelled **Manual sale** and have no order link.
+   After successful completion, **Mark Completed** stays disabled and
+   **Print invoice** becomes available. Printing is disabled at every earlier
+   stage and for cancelled orders; the state persists after reloading.
+
+**Print invoice** opens the browser's print preview with an invoice-only A4
+layout and 14 mm margins. It includes the issue date, customer details, items,
+UOM, prices, total, and order/payment status. Navigation, workflow controls,
+update notices, internal notes, and private tracking links are excluded.
+Long invoices flow across pages with repeated item-table headers. Browser
+headers/footers (URL and page title) can be disabled in the print dialog.
+
+Reports group completed-order and manual sales by the workspace timezone.
+Sales and expenses cover today and the preceding 89 calendar days, excluding
+older dates and future dates. Gross sales, expenses, and net income use this
+same period and the workspace reporting currency; days without sales have no
+row. Orders by status remains an explicitly labelled all-time summary.
+The reports API includes `timezone`, `startDay`, and `endDay` for this period.
+
+Settings uses separate Business details and Preferences tabs. The selected
+tab is reflected in the URL hash (`#business` or `#preferences`), including
+reloads and browser history. Arrow keys and Home/End switch tabs. Unsaved
+edits remain when switching tabs; Save settings saves only the selected
+section. Team & access opens user management.
+
+Customer profiles include an editable Social media links card beside Contact
+on wide screens and stacked on small screens. Facebook, Instagram, TikTok,
+WhatsApp, and Website links are optional, customer-specific, and persist after
+restart. Links open in a separate tab without sharing the referring page.
+Only full HTTPS URLs without embedded credentials are accepted; social links
+must use their platform's domain (including subdomains). Website accepts any
+HTTPS domain. Blank strings or `null` remove a link; omitted fields are unchanged.
+Customer create/update APIs accept `facebookUrl`, `instagramUrl`, `tiktokUrl`,
+`whatsappUrl`, and `websiteUrl`; reads expose the same fields. These are manually
+maintained links, not connected or verified social accounts, and are not exposed
+on public checkout or order-tracking pages.
+
+Each Expenses table entry has a **View details** action that opens its full
+description, category, recorded date, amount/currency, notes, and entry ID in a
+read-only dialog. Opening details does not change or create a transaction.
 
 Inventory shows on-hand, reserved, and available quantities per UOM/location.
 Manual stock-outs, transfers, and physical-count adjustments cannot consume
@@ -556,7 +611,10 @@ Example normalized import:
 Use `variantId` instead of `sku` when known. An adapter with approved provider
 API access must translate native payloads to this format before importing.
 Raw provider webhooks are not accepted and no connectors are simulated.
-Dispatch requires `{ "stage": "shipped", "carrier": "...", "trackingNumber": "..." }`.
+Dispatch requires `{ "stage": "shipped", "carrier": "..." }`, with optional
+`trackingNumber`. Nonblank strings are trimmed and preserved (maximum 150
+characters); omitted or blank strings generate an internal tracking number.
+Carrier names remain free-form in the API (maximum 100 characters).
 Legacy free-form `{status}` updates are intentionally rejected to prevent
 bypassing payment and inventory guards.
 The inbox GET supports `page`, `search`, `stage`, `channel`, and `payment` query
