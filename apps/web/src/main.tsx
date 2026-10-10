@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   Activity, ArrowDownLeft, ArrowDownToLine, ArrowLeftRight, ArrowUpRight, Bell,
@@ -15,19 +15,23 @@ import "./styles.css";
 import { api, money, dateLabel, useLoad } from "./api";
 import { CommerceOrders, CommerceOrderDetails, CheckoutPage, TrackingPage } from "./commerce";
 import { RawMaterialBomPage } from "./bom";
+import { ProfileSocialLinks, profilePlatforms, type ProfileLinks } from "./profile-social";
+import { ProfilePicture, UserAvatar, initials } from "./profile-picture";
+import { canAccessPage, homePath, isAdmin, roleLabel, workspaceRoles, type Role } from "./roles";
 
-type Role = "owner" | "admin" | "staff";
 interface User {
   id: string;
   name: string;
   email: string;
   role: Role;
+  avatarUrl: string | null;
 }
 interface SessionState {
   user: User | null;
   needsSetup: boolean;
   rawMaterialBomEnabled: boolean;
   refresh: () => Promise<void>;
+  updateAvatar: (url: string | null) => void;
 }
 interface Product {
   id: string;
@@ -81,6 +85,7 @@ const SessionContext = createContext<SessionState>({
   needsSetup: false,
   rawMaterialBomEnabled: false,
   refresh: async () => undefined,
+  updateAvatar: () => undefined,
 });
 
 function stockQuantitySummary(rows: Record<string, unknown>[]): string {
@@ -102,29 +107,43 @@ function UomField({ value, onChange, locked = false }: { value: string; onChange
   </label>;
 }
 
-function initials(name: string): string {
-  return name.trim().split(/\s+/).slice(0, 2).map((part) => part[0]?.toUpperCase() ?? "").join("");
-}
-
 function SessionProvider(): React.JSX.Element {
   const [user, setUser] = useState<User | null>(null);
   const [needsSetup, setNeedsSetup] = useState(false);
   const [rawMaterialBomEnabled, setRawMaterialBomEnabled] = useState(false);
   const [ready, setReady] = useState(false);
-  const refresh = async () => {
+  const [syncError, setSyncError] = useState("");
+  const refresh = useCallback(async () => {
     try {
       const status = await api<{ user: User | null; needsSetup: boolean; rawMaterialBomEnabled: boolean }>("/auth/status");
       setUser(status.user);
       setNeedsSetup(status.needsSetup);
       setRawMaterialBomEnabled(status.rawMaterialBomEnabled);
+      setSyncError("");
     } finally {
       setReady(true);
     }
-  };
+  }, []);
   useEffect(() => { void refresh().catch(() => setReady(true)); }, []);
+  useEffect(() => {
+    if (!user || !("BroadcastChannel" in window)) return;
+    const channel = new BroadcastChannel("sellerone-profile-picture");
+    channel.onmessage = (event: MessageEvent<unknown>) => {
+      if (event.data === user.id) void refresh().catch(() => setSyncError("Could not refresh your profile picture. Reload this page to retry."));
+    };
+    return () => channel.close();
+  }, [user?.id, refresh]);
+  const updateAvatar = (avatarUrl: string | null) => {
+    setUser((current) => current ? { ...current, avatarUrl } : current);
+    if (user && "BroadcastChannel" in window) {
+      const channel = new BroadcastChannel("sellerone-profile-picture");
+      channel.postMessage(user.id); channel.close();
+    }
+  };
   if (!ready) return <div className="boot-screen"><span className="brand-glyph">S</span><span>Opening your workspace…</span></div>;
   return (
-    <SessionContext.Provider value={{ user, needsSetup, rawMaterialBomEnabled, refresh }}>
+    <SessionContext.Provider value={{ user, needsSetup, rawMaterialBomEnabled, refresh, updateAvatar }}>
+      {syncError && <div className="error-box" role="alert">{syncError}</div>}
       <Routes>
         <Route path="/login" element={<AuthPage mode="login" />} />
         <Route path="/setup" element={<AuthPage mode="setup" />} />
@@ -150,6 +169,7 @@ function SessionProvider(): React.JSX.Element {
           <Route path="accounting" element={<AccountingPage />} />
           <Route path="reports" element={<ReportsPage />} />
           <Route path="settings" element={<SettingsPage />} />
+          <Route path="profile" element={<ProfileSettingsPage />} />
           <Route path="users" element={<UsersPage />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Route>
@@ -176,7 +196,7 @@ const primaryNav = [
   ] },
 ];
 
-function AccountOptions({ user, onNavigate }: { user: User; onNavigate: () => void }): React.JSX.Element {
+function AccountOptions({ user, onNavigate, avatar = false }: { user: User; onNavigate: () => void; avatar?: boolean }): React.JSX.Element {
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -184,7 +204,8 @@ function AccountOptions({ user, onNavigate }: { user: User; onNavigate: () => vo
   const trigger = React.useRef<HTMLButtonElement>(null);
   const panelId = React.useId();
   const location = useLocation();
-  useEffect(() => { setOpen(false); }, [location.pathname]);
+  useEffect(() => { setOpen(false); }, [location.key]);
+  const social = useLoad<{ links: ProfileLinks }>(open ? "/me/social-links" : "");
   useEffect(() => {
     if (!open) return;
     const dismiss = (event: PointerEvent | FocusEvent) => {
@@ -215,18 +236,24 @@ function AccountOptions({ user, onNavigate }: { user: User; onNavigate: () => vo
       setBusy(false);
     }
   };
-  return <div className="account-options" ref={container}>
-    <button ref={trigger} className="icon-button profile-more" type="button" aria-label="Account options" aria-expanded={open} aria-controls={panelId} onClick={() => setOpen((value) => !value)}><MoreHorizontal size={19} /></button>
-    {open && <div className="account-panel" id={panelId} role="region" aria-label="Account options">
+  return <div className={`account-options${avatar ? " account-options-top" : ""}`} ref={container}>
+    <button ref={trigger} className={avatar ? "icon-button profile-avatar-trigger" : "icon-button profile-more"} type="button" aria-label={avatar ? "Profile Settings" : "Account options"} aria-expanded={open} aria-controls={panelId} onClick={() => setOpen((value) => !value)}>{avatar ? <UserAvatar name={user.name} avatarUrl={user.avatarUrl} className="avatar-top" /> : <MoreHorizontal size={19} />}</button>
+    {open && <div className="account-panel" id={panelId} role="region" aria-label={avatar ? "Profile Settings menu" : "Account options"}>
       <strong>{user.name}</strong><small>{user.email}</small>
-      {user.role !== "staff" && <Link className="account-action" to="/settings" onClick={() => { setOpen(false); onNavigate(); }}><Settings size={16} /> Workspace settings</Link>}
+      <Link className="account-action" to="/profile" onClick={() => { setOpen(false); onNavigate(); }}><UserRound size={16} /> Account details</Link>
+      <Link className="account-action" to="/profile#security" onClick={() => { setOpen(false); onNavigate(); }}><ShieldCheck size={16} /> Security / password</Link>
+      <Link className="account-action" to="/profile#preferences" onClick={() => { setOpen(false); onNavigate(); }}><SlidersHorizontal size={16} /> Preferences</Link>
+      {isAdmin(user.role) && <Link className="account-action" to="/settings" onClick={() => { setOpen(false); onNavigate(); }}><Settings size={16} /> Workspace settings</Link>}
+      {social.loading && <small role="status">Loading social links...</small>}
+      {social.error && <div className="error-box" role="alert">{social.error}<button type="button" className="text-button" onClick={social.reload}>Retry social links</button></div>}
+      {social.data && profilePlatforms.map(({ field, label, icon: Icon }) => social.data?.links[field].visible && social.data.links[field].url && <a key={field} className="account-action" href={social.data.links[field].url ?? undefined} target="_blank" rel="noopener noreferrer"><Icon size={16} aria-hidden="true" /> {label} profile</a>)}
       <button className="account-action" type="button" disabled={busy} onClick={() => void signOut()}><LogOut size={16} /> {busy ? "Signing out..." : "Sign out"}</button>
       {error && <div className="error-box" role="alert">{error}</div>}
     </div>}
   </div>;
 }
 
-function StockNotifications(): React.JSX.Element {
+function StockNotifications({ canManageInventory }: { canManageInventory: boolean }): React.JSX.Element {
   const location = useLocation();
   const [open, setOpen] = useState(false);
   const container = useRef<HTMLDivElement>(null);
@@ -293,7 +320,7 @@ function StockNotifications(): React.JSX.Element {
   }}>
     <button ref={trigger} className="icon-button notification-button" type="button"
       aria-label={error ? "Notifications: unavailable" : count ? `Notifications: ${count} unread` : "Notifications"}
-      aria-expanded={open} aria-controls="stock-notifications-panel" onClick={() => { if (!open) reload(); setOpen((current) => !current); }}>
+      aria-expanded={open} aria-controls="stock-notifications-panel" onClick={() => { if (!open) { setSelected(null); setViewError(""); reload(); } setOpen((current) => !current); }}>
       <Bell size={18} />{count > 0 && <span className="notification-count" aria-hidden="true">{count > 99 ? "99+" : count}</span>}
     </button>
     {open && <section id="stock-notifications-panel" className="notification-panel" aria-labelledby="stock-notifications-title" aria-busy={loading}>
@@ -312,17 +339,17 @@ function StockNotifications(): React.JSX.Element {
       </section>}
       {loading ? <p role="status">Checking stock alerts...</p> : error ? <div className="error-box" role="alert">{error}</div>
         : data?.items.length ? <><ul className="notification-list" aria-label="Selectable notifications">
-          {data.items.map((item) => <li key={item.id}>
+          {data.items.filter((item) => item.status === "unread").map((item) => <li key={item.id}>
             <button type="button" className={`notification-item ${item.status}`} disabled={viewing} aria-pressed={selected?.id === item.id} onClick={() => void view(item.id)}>
               <strong>{item.productName} · {item.variantName}</strong>
               <small>{item.sku} · {item.locationName}</small>
               <span>{item.status === "unread" ? "Unread" : "Read"} · View details</span>
             </button>
           </li>)}
-        </ul></> : <p role="status">No low-stock alerts. Stock is above minimum levels.</p>}
+        </ul></> : <p role="status">No pending unread alerts. Viewed alerts have been cleared from this list; stock shortages may still require attention.</p>}
       {viewing && <p role="status">Opening notification...</p>}
-      <div className="notification-actions"><button className="button button-secondary" type="button" disabled={loading} onClick={reload}>Refresh alerts</button><Link className="button" to="/inventory" onClick={() => setOpen(false)}>View inventory</Link></div>
-      <small>Read status is saved per user. Opening the bell alone does not mark items read. A new unread notification is created only after stock recovers above minimum and later becomes low again.</small>
+      <div className="notification-actions"><button className="button button-secondary" type="button" disabled={loading || viewing} onClick={() => { setSelected(null); setViewError(""); reload(); }}>Refresh alerts</button>{canManageInventory && <Link className="button" to="/inventory" onClick={() => setOpen(false)}>View inventory</Link>}</div>
+      <small>Only pending unread alerts are listed. Read status is saved per user; refreshing does not acknowledge unread items. A new unread notification is created only after stock recovers above minimum and later becomes low again.</small>
     </section>}
   </div>;
 }
@@ -333,12 +360,13 @@ function ProtectedLayout(): React.JSX.Element {
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   if (needsSetup) return <Navigate to="/setup" replace />;
   if (!user) return <Navigate to="/login" state={{ from: location.pathname }} replace />;
-  const current = [...primaryNav.flatMap((section) => section.items), { to: "/raw-material-bom", label: "Raw Material BOM", icon: Boxes }, ...(user.role !== "staff" ? [{ to: "/settings", label: "Settings", icon: Settings }] : [])]
+  if (location.pathname === "/" && homePath(user.role) !== "/") return <Navigate to={homePath(user.role)} replace />;
+  const current = [...primaryNav.flatMap((section) => section.items), { to: "/profile", label: "Profile Settings", icon: UserRound }, { to: "/raw-material-bom", label: "Raw Material BOM", icon: Boxes }, ...(isAdmin(user.role) ? [{ to: "/settings", label: "Settings", icon: Settings }, { to: "/users", label: "User management", icon: Users }] : [])]
     .find((item) => item.to === location.pathname);
   return (
     <div className="app-shell">
       <aside className={`sidebar ${mobileNavOpen ? "sidebar-open" : ""}`}>
-        <Link className="brand" to="/">
+        <Link className="brand" to={homePath(user.role)}>
           <span className="brand-glyph">S</span>
           <span className="brand-name">seller<span>one</span></span>
           <span className="brand-period">.</span>
@@ -349,10 +377,10 @@ function ProtectedLayout(): React.JSX.Element {
           <ChevronDown size={15} className="muted" />
         </div>
         <nav className="side-nav" aria-label="Main navigation">
-          {primaryNav.map((section) => (
+          {primaryNav.filter((section) => section.items.some((item) => canAccessPage(user.role, item.to))).map((section) => (
             <div className="nav-section" key={section.label}>
               <span className="nav-heading">{section.label}</span>
-              {section.items.map(({ to, label, icon: Icon }) => (
+              {section.items.filter((item) => canAccessPage(user.role, item.to)).map(({ to, label, icon: Icon }) => (
                 <Link key={to} className={`nav-link ${location.pathname === to || (to !== "/" && location.pathname.startsWith(to)) ? "active" : ""}`} to={to} onClick={() => setMobileNavOpen(false)}>
                   <Icon size={17} strokeWidth={1.8} /><span>{label}</span>
                   {label === "Inventory" && <span className="nav-dot" />}
@@ -360,18 +388,18 @@ function ProtectedLayout(): React.JSX.Element {
               ))}
             </div>
           ))}
-          <div className="nav-section">
+          {(isAdmin(user.role) || (rawMaterialBomEnabled && canAccessPage(user.role, "/raw-material-bom"))) && <div className="nav-section">
             <span className="nav-heading">Workspace</span>
-            {rawMaterialBomEnabled && <Link className={`nav-link ${location.pathname === "/raw-material-bom" ? "active" : ""}`} to="/raw-material-bom" onClick={() => setMobileNavOpen(false)}><Boxes size={17} strokeWidth={1.8} /><span>Raw Material BOM</span></Link>}
-            {user.role !== "staff" && <Link className={`nav-link ${location.pathname === "/users" ? "active" : ""}`} to="/users"><UserRoundPlus size={17} strokeWidth={1.8} /><span>User management</span></Link>}
-            {user.role !== "staff" && <Link className={`nav-link ${location.pathname === "/settings" ? "active" : ""}`} to="/settings"><Settings size={17} strokeWidth={1.8} /><span>Settings</span></Link>}
-          </div>
+            {rawMaterialBomEnabled && canAccessPage(user.role, "/raw-material-bom") && <Link className={`nav-link ${location.pathname === "/raw-material-bom" ? "active" : ""}`} to="/raw-material-bom" onClick={() => setMobileNavOpen(false)}><Boxes size={17} strokeWidth={1.8} /><span>Raw Material BOM</span></Link>}
+            {isAdmin(user.role) && <Link className={`nav-link ${location.pathname === "/users" ? "active" : ""}`} to="/users"><UserRoundPlus size={17} strokeWidth={1.8} /><span>User management</span></Link>}
+            {isAdmin(user.role) && <Link className={`nav-link ${location.pathname === "/settings" ? "active" : ""}`} to="/settings"><Settings size={17} strokeWidth={1.8} /><span>Settings</span></Link>}
+          </div>}
         </nav>
         <div className="sidebar-bottom">
           <div className="help-card"><span className="help-icon"><LifeBuoy size={17} /></span><strong>Need a hand?</strong><p>We’re here to help you get the most out of SellerOne.</p><button className="text-button" type="button">Visit help center <ChevronRight size={14} /></button></div>
           <div className="profile-mini">
-            <span className="avatar avatar-sage">{initials(user.name)}</span>
-            <span className="profile-meta"><strong>{user.name}</strong><small>{user.role === "owner" ? "Workspace owner" : user.role}</small></span>
+            <UserAvatar name={user.name} avatarUrl={user.avatarUrl} className="avatar-sage" />
+            <span className="profile-meta"><strong>{user.name}</strong><small>{user.role === "owner" ? "Workspace owner" : roleLabel(user.role)}</small></span>
             <AccountOptions user={user} onNavigate={() => setMobileNavOpen(false)} />
           </div>
         </div>
@@ -380,15 +408,15 @@ function ProtectedLayout(): React.JSX.Element {
       <section className="main-column">
         <header className="topbar">
           <button className="icon-button mobile-menu" aria-label="Open menu" onClick={() => setMobileNavOpen(true)}><Menu size={20} /></button>
-          <div className="breadcrumbs"><span>Workspace</span><ChevronRight size={14} /><strong>{current?.label ?? (location.pathname.startsWith("/orders/") ? "Order details" : location.pathname.startsWith("/customers/") ? "Customer profile" : "Edit product")}</strong></div>
+          <div className="breadcrumbs"><span>Workspace</span><ChevronRight size={14} /><strong>{!canAccessPage(user.role, location.pathname) ? "Access restricted" : current?.label ?? (location.pathname.startsWith("/orders/") ? "Order details" : location.pathname.startsWith("/customers/") ? "Customer profile" : "Edit product")}</strong></div>
           <div className="topbar-actions">
             <span className="today-label">{new Intl.DateTimeFormat("en-PH", { weekday: "short", month: "short", day: "numeric" }).format(new Date())}</span>
             <button className="icon-button search-trigger" type="button"><Search size={18} /><span>Search</span><kbd>⌘ K</kbd></button>
-            <StockNotifications />
-            <span className="avatar avatar-top">{initials(user.name)}</span>
+            {user.role !== "customer_relations_representative" && <StockNotifications canManageInventory={canAccessPage(user.role, "/inventory")} />}
+            <AccountOptions user={user} avatar onNavigate={() => setMobileNavOpen(false)} />
           </div>
         </header>
-        <main className="page-content"><Outlet /></main>
+        <main className="page-content">{canAccessPage(user.role, location.pathname) ? <Outlet /> : <section className="panel form-panel"><h1>Access restricted</h1><p role="alert">Your workspace role does not have access to this screen.</p><Link className="button" to={homePath(user.role)}>Go to my workspace</Link></section>}</main>
         <footer className="app-footer"><span>SellerOne <span className="footer-dot">·</span> Your business, in sync.</span><span>Made for the way you sell <Sparkles size={13} /></span></footer>
       </section>
     </div>
@@ -995,6 +1023,7 @@ function CustomerSocialCard({ customer, saved }: { customer: Customer; saved: ()
 }
 
 function CustomerProfilePage(): React.JSX.Element {
+  const { user } = useContext(SessionContext);
   const { id } = useParams();
   const { data, error, loading, reload } = useLoad<Customer & { orders: Record<string, unknown>[] }>(`/customers/${id}`);
   if (loading) return <LoadingGrid />;
@@ -1004,7 +1033,7 @@ function CustomerProfilePage(): React.JSX.Element {
     <PageHeading eyebrow="YOUR CUSTOMER BOOK" title={String(data.name)} description={`A customer since ${dateLabel(data.createdAt)}.`} action={<Button variant="secondary" onClick={() => window.print()}><FileText size={16} /> Print profile</Button>} />
     <div className="stat-grid customer-summary-grid"><StatCard label="Lifetime sales" value={money(data.spentMinor)} icon={<Wallet size={17} />} /><StatCard label="Orders" value={String(data.orderCount ?? 0)} icon={<ShoppingBag size={17} />} tone="blue" /><StatCard label="Contact" value={String(data.email || data.phone || "Not added")} icon={<UserRound size={17} />} tone="lilac" /><CustomerSocialCard customer={data} saved={reload} /></div>
     <div className="detail-grid customer-detail-grid"><section className="panel"><SectionHeading title="Order history" subtitle="A little history, a lot of context." /><DataTable rowKey="id" rows={data.orders as Record<string, unknown>[]} empty="There are no orders for this customer yet." columns={[
-      { label: "ORDER", render: (row) => <Link className="table-primary" to={`/orders/${row.id}`}>{String(row.orderNumber)}</Link> },
+      { label: "ORDER", render: (row) => user && canAccessPage(user.role, "/orders") ? <Link className="table-primary" to={`/orders/${row.id}`}>{String(row.orderNumber)}</Link> : String(row.orderNumber) },
       { label: "DATE", render: (row) => dateLabel(row.createdAt) },
       { label: "STATUS", render: (row) => <StatusPill status={String(row.status)} /> },
       { label: "TOTAL", className: "align-right", render: (row) => money(row.totalMinor, String(row.currency)) },
@@ -1110,6 +1139,84 @@ function ReportsPage(): React.JSX.Element {
   </>;
 }
 
+function ProfileSettingsPage(): React.JSX.Element {
+  const { user, refresh, updateAvatar } = useContext(SessionContext);
+  const location = useLocation();
+  const [name, setName] = useState(user?.name ?? "");
+  const [email, setEmail] = useState(user?.email ?? "");
+  const [currentPassword, setCurrentPassword] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmation, setConfirmation] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+  const tab = location.hash === "#security" ? "security" : location.hash === "#preferences" ? "preferences" : "account";
+  const [editing, setEditing] = useState(false);
+  const nameInput = React.useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    setEditing(false); setName(user?.name ?? ""); setEmail(user?.email ?? "");
+    setCurrentPassword(""); setNewPassword(""); setConfirmation(""); setError(""); setNotice("");
+  }, [tab, user?.name, user?.email]);
+  const cancelEdit = () => {
+    setEditing(false); setName(user?.name ?? ""); setEmail(user?.email ?? "");
+    setCurrentPassword(""); setError(""); setNotice("");
+  };
+  const save = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (busy || (tab === "account" && !editing)) return;
+    setError(""); setNotice("");
+    if (tab === "account" && !name.trim()) { setError("Full name is required."); nameInput.current?.focus(); return; }
+    if (tab === "security" && newPassword !== confirmation) { setError("New passwords do not match."); return; }
+    setBusy(true);
+    try {
+      const result = await api<{ user: User }>(tab === "security" ? "/me/password" : "/me", {
+        method: tab === "security" ? "POST" : "PATCH",
+        body: JSON.stringify(tab === "security" ? { currentPassword, newPassword } : { name, email, ...(email.trim().toLowerCase() !== user?.email ? { currentPassword } : {}) }),
+      });
+      setName(result.user.name); setEmail(result.user.email);
+      setCurrentPassword(""); setNewPassword(""); setConfirmation("");
+      await refresh();
+      setEditing(false);
+      setNotice(tab === "security" ? "Password changed. Other sessions were signed out." : "Account details saved successfully.");
+    } catch (caught) { setError(caught instanceof Error ? caught.message : "Could not save profile settings."); }
+    finally { setBusy(false); }
+  };
+  return <>
+    <PageHeading eyebrow="YOUR ACCOUNT" title="Profile Settings" description="Manage your personal account details and security." />
+    <nav className="form-actions" aria-label="Profile settings sections">
+      <Link className="button button-secondary" aria-current={tab === "account" ? "page" : undefined} to="/profile">Account details</Link>
+      <Link className="button button-secondary" aria-current={tab === "security" ? "page" : undefined} to="/profile#security">Security</Link>
+      <Link className="button button-secondary" aria-current={tab === "preferences" ? "page" : undefined} to="/profile#preferences">Preferences</Link>
+    </nav>
+    {error && <div className="error-box" role="alert">{error}</div>}
+    {notice && <div className="success-box" role="status">{notice}</div>}
+    {tab === "account" && user && <ProfilePicture name={user.name} avatarUrl={user.avatarUrl} onSaved={updateAvatar} />}
+    <section className="panel form-panel">
+      {tab === "preferences" ? <><h2>Preferences</h2><p>Workspace preferences apply to everyone in your business; they are not personal settings.</p>{user && isAdmin(user.role) ? <Link className="button" to="/settings#preferences">Manage workspace preferences</Link> : <p>Contact an owner or admin to change workspace preferences.</p>}<p>Notification read status is personal and saved automatically when you view an alert.</p></>
+        : <form onSubmit={(event) => void save(event)} className="modal-form">
+          <h2>{tab === "security" ? "Change password" : "Account details"}</h2>
+          {tab === "account" ? <>
+            <label className="field-label">Full name<input ref={nameInput} required maxLength={200} autoComplete="name" value={name} readOnly={!editing} disabled={busy} onChange={(event) => setName(event.target.value)} /></label>
+            <label className="field-label">Email<input required type="email" maxLength={254} autoComplete="email" value={email} readOnly={!editing} disabled={busy} onChange={(event) => setEmail(event.target.value)} /></label>
+            <p>Role: {roleLabel(user?.role)}. Email changes require your current password and sign out other sessions. Use the new email for future sign-ins.</p>
+          </> : <p>Use 10-200 characters. Changing your password signs out other sessions and invalidates pending password reset links.</p>}
+          {(tab === "security" || (editing && email.trim().toLowerCase() !== user?.email)) && <label className="field-label">Current password<input required type="password" minLength={10} maxLength={200} autoComplete="current-password" value={currentPassword} disabled={busy} onChange={(event) => setCurrentPassword(event.target.value)} /></label>}
+          {tab === "security" && <>
+            <label className="field-label">New password<input required type="password" minLength={10} maxLength={200} autoComplete="new-password" value={newPassword} disabled={busy} onChange={(event) => setNewPassword(event.target.value)} /></label>
+            <label className="field-label">Confirm new password<input required type="password" minLength={10} maxLength={200} autoComplete="new-password" value={confirmation} disabled={busy} onChange={(event) => setConfirmation(event.target.value)} /></label>
+          </>}
+          <div className="form-actions">
+            {tab === "account" && !editing ? <Button type="button" onClick={(event) => { event.preventDefault(); setEditing(true); setError(""); setNotice(""); nameInput.current?.focus(); }}>Edit Account Details</Button> : <>
+              <Button type="submit" disabled={busy}>{busy ? "Saving..." : tab === "security" ? "Change password" : "Save Changes"}</Button>
+              {tab === "account" && <Button type="button" variant="secondary" disabled={busy} onClick={cancelEdit}>Cancel</Button>}
+            </>}
+          </div>
+        </form>}
+    </section>
+    {tab === "account" && <ProfileSocialLinks />}
+  </>;
+}
+
 function SettingsPage(): React.JSX.Element {
   const { refresh } = useContext(SessionContext);
   const location = useLocation();
@@ -1165,21 +1272,52 @@ function SettingsPage(): React.JSX.Element {
   </>;
 }
 
+function WorkspaceRoleSelect({ name, label, value, onChange, disabled }: { name?: string; label: string; value: string; onChange: (value: string) => void; disabled?: boolean }): React.JSX.Element {
+  return <label className="field-label">{label}<select aria-label={label} name={name} value={value} disabled={disabled} onChange={(event) => onChange(event.target.value)}>
+    {workspaceRoles.map((role) => <option key={role.value} value={role.value}>{role.label}</option>)}
+  </select><small>{workspaceRoles.find((role) => role.value === value)?.description}</small></label>;
+}
+
+function WorkspaceRoleEditor({ current, name, endpoint, onSaved, onError }: { current: string; name: string; endpoint: string; onSaved: () => void; onError: (message: string) => void }): React.JSX.Element {
+  const [role, setRole] = useState(current);
+  const [busy, setBusy] = useState(false);
+  useEffect(() => { setRole(current); }, [current]);
+  const save = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (busy || role === current) return;
+    setBusy(true); onError("");
+    try { await api(endpoint, { method: "PATCH", body: JSON.stringify({ role }) }); onSaved(); }
+    catch (caught) { onError(caught instanceof Error ? caught.message : "Could not update the workspace role."); }
+    finally { setBusy(false); }
+  };
+  return <form className="workspace-role-editor" onSubmit={(event) => void save(event)}>
+    <WorkspaceRoleSelect label={`Workspace role for ${name}`} value={role} disabled={busy} onChange={setRole} />
+    <Button type="submit" variant="secondary" disabled={busy || role === current}>{busy ? "Saving..." : "Save role"}</Button>
+  </form>;
+}
+
 function UsersPage(): React.JSX.Element {
+  const { user } = useContext(SessionContext);
   const { data, loading, error, reload } = useLoad<{ items: Record<string, unknown>[]; invitations: Record<string, unknown>[] }>("/users");
   const [modal, setModal] = useState(false);
   const [notice, setNotice] = useState("");
   const [errorMessage, setErrorMessage] = useState("");
   const [inviteUrl, setInviteUrl] = useState("");
   const [copied, setCopied] = useState(false);
+  const [inviteRole, setInviteRole] = useState("staff");
+  const [inviting, setInviting] = useState(false);
+  const owner = user?.role === "owner";
   const create = async (event: React.FormEvent<HTMLFormElement>) => {
-    event.preventDefault(); setNotice(""); setErrorMessage(""); setInviteUrl("");
+    event.preventDefault(); if (inviting) return;
+    setNotice(""); setErrorMessage(""); setInviteUrl(""); setInviting(true);
     const body = Object.fromEntries(new FormData(event.currentTarget).entries());
     try {
       const result = await api<{ inviteUrl: string }>("/users", { method: "POST", body: JSON.stringify(body) });
       setInviteUrl(result.inviteUrl); setNotice("Invitation created. Copy this private link and send it to your teammate."); reload();
     } catch (caught) { setErrorMessage(caught instanceof Error ? caught.message : "Could not create invitation."); }
+    finally { setInviting(false); }
   };
+  const roleSaved = () => { setNotice("Workspace role updated. Changed team members must sign in again."); reload(); };
   const toggle = async (row: Record<string, unknown>) => {
     setNotice(""); setErrorMessage("");
     try { await api(`/users/${row.id}`, { method: "PATCH", body: JSON.stringify({ active: !row.active }) }); reload(); }
@@ -1190,23 +1328,23 @@ function UsersPage(): React.JSX.Element {
     catch { setErrorMessage("Couldn’t copy automatically. Select and copy the invitation link."); }
   };
   return <>
-    <PageHeading eyebrow="THE PEOPLE BEHIND IT" title="User management" description="Invite your people in, and keep the right things in the right hands." action={<Button onClick={() => { setModal(true); setInviteUrl(""); setNotice(""); }}><UserRoundPlus size={17} /> Invite a teammate</Button>} />
+    <PageHeading eyebrow="THE PEOPLE BEHIND IT" title="User management" description="Invite your people in, and keep the right things in the right hands." action={<Button onClick={() => { setModal(true); setInviteUrl(""); setNotice(""); setErrorMessage(""); setInviteRole("staff"); }}><UserRoundPlus size={17} /> Invite a teammate</Button>} />
     {error && <PageError message={error} />}{errorMessage && <PageError message={errorMessage} />}{notice && <div className="success-box"><ShieldCheck size={17} />{notice}</div>}
     <div className="stat-grid stat-grid-three"><StatCard label="Team members" value={String(data?.items.length ?? 0)} change="People with workspace access" icon={<Users size={17} />} /><StatCard label="Workspace owners" value={String((data?.items ?? []).filter((row) => row.role === "owner" && row.active).length)} change="Full access and ownership" icon={<ShieldCheck size={17} />} tone="blue" /><StatCard label="Pending invitations" value={String(data?.invitations.length ?? 0)} change="Links expire after seven days" icon={<UserRoundPlus size={17} />} tone="lilac" /></div>
     <section className="panel list-panel"><SectionHeading title="Your team" subtitle="You can change a teammate’s access any time." />{loading ? <div className="table-skeleton" /> : <DataTable rowKey="id" rows={data?.items ?? []} empty="You’re the first member of your team." columns={[
-      { label: "TEAMMATE", render: (row) => <span className="product-cell"><span className="avatar avatar-customer">{initials(String(row.name))}</span><span><strong>{String(row.name)}</strong><small>{String(row.email)}</small></span></span> },
-      { label: "ROLE", render: (row) => <span className="channel-tag">{String(row.role)}</span> },
+      { label: "TEAMMATE", render: (row) => <span className="product-cell"><UserAvatar name={String(row.name)} avatarUrl={user && row.id === user.id ? user.avatarUrl : typeof row.avatarUrl === "string" ? row.avatarUrl : null} className="avatar-customer" /><span><strong>{String(row.name)}</strong><small>{String(row.email)}</small></span></span> },
+      { label: "ROLE", render: (row) => owner && row.role !== "owner" ? <WorkspaceRoleEditor current={String(row.role)} name={String(row.name)} endpoint={`/users/${row.id}`} onSaved={roleSaved} onError={setErrorMessage} /> : <span className="channel-tag">{roleLabel(row.role)}</span> },
       { label: "JOINED", render: (row) => dateLabel(row.createdAt) },
       { label: "ACCESS", render: (row) => <StatusPill status={row.active ? "Active" : "Inactive"} /> },
-      { label: "", render: (row) => row.role === "owner" ? <span className="muted">Owner</span> : <button className="row-action button-link" onClick={() => void toggle(row)}>{row.active ? "Deactivate" : "Reactivate"}</button> },
+      { label: "", render: (row) => row.role === "owner" || (!owner && row.role === "admin") ? <span className="muted">{roleLabel(row.role)}</span> : <button className="row-action button-link" onClick={() => void toggle(row)}>{row.active ? "Deactivate" : "Reactivate"}</button> },
     ]} />}</section>
     {Boolean(data?.invitations.length) && <section className="panel invitation-panel"><SectionHeading title="Pending invitations" /><DataTable rowKey="email" rows={data?.invitations ?? []} empty="No pending invites." columns={[
       { label: "NAME", render: (row) => String(row.name) },
       { label: "EMAIL", render: (row) => String(row.email) },
-      { label: "ROLE", render: (row) => <span className="channel-tag">{String(row.role)}</span> },
+      { label: "ROLE", render: (row) => owner && new Date(String(row.expiresAt)).getTime() > Date.now() ? <WorkspaceRoleEditor current={String(row.role)} name={`${row.name} (invitation)`} endpoint={`/invitations/${encodeURIComponent(String(row.email))}`} onSaved={() => { setNotice("Invitation role updated. The existing invitation link is unchanged."); reload(); }} onError={setErrorMessage} /> : <span className="channel-tag">{roleLabel(row.role)}</span> },
       { label: "EXPIRES", render: (row) => dateLabel(row.expiresAt) },
     ]} /></section>}
-    {modal && <Modal title="Invite a teammate" onClose={() => setModal(false)}>{inviteUrl ? <div className="invite-created"><span className="success-icon"><UserRoundPlus size={20} /></span><h3>Your invite is ready to go.</h3><p>This private link gives one person access and expires in seven days.</p><div className="copy-link"><input readOnly value={inviteUrl} onFocus={(event) => event.target.select()} /><Button variant="secondary" onClick={() => void copy()}>{copied ? "Copied!" : "Copy link"}</Button></div><div className="modal-actions"><Button variant="secondary" onClick={() => { setModal(false); reload(); }}>Done</Button><Button onClick={() => { setInviteUrl(""); setNotice(""); setCopied(false); }}>Invite another</Button></div></div> : <form className="modal-form" onSubmit={(event) => void create(event)}><label className="field-label">Full name<input name="name" required maxLength={200} /></label><label className="field-label">Work email<input type="email" name="email" required /></label><label className="field-label">Workspace role<select name="role"><option value="staff">Staff — day-to-day access</option><option value="admin">Admin — manage workspace & team</option></select></label>{errorMessage && <PageError message={errorMessage} />}<div className="modal-actions"><Button type="button" variant="secondary" onClick={() => setModal(false)}>Cancel</Button><Button type="submit">Create invitation</Button></div></form>}</Modal>}
+    {modal && <Modal title="Invite a teammate" onClose={() => { if (!inviting) setModal(false); }}>{inviteUrl ? <div className="invite-created"><span className="success-icon"><UserRoundPlus size={20} /></span><h3>Your invite is ready to go.</h3><p>This private link gives one person access and expires in seven days.</p><div className="copy-link"><input readOnly value={inviteUrl} onFocus={(event) => event.target.select()} /><Button variant="secondary" onClick={() => void copy()}>{copied ? "Copied!" : "Copy link"}</Button></div><div className="modal-actions"><Button variant="secondary" onClick={() => { setModal(false); reload(); }}>Done</Button><Button onClick={() => { setInviteUrl(""); setNotice(""); setCopied(false); setInviteRole("staff"); }}>Invite another</Button></div></div> : <form className="modal-form" onSubmit={(event) => void create(event)}><label className="field-label">Full name<input name="name" required maxLength={200} disabled={inviting} /></label><label className="field-label">Work email<input type="email" name="email" required disabled={inviting} /></label>{owner ? <WorkspaceRoleSelect name="role" label="Workspace role" value={inviteRole} onChange={setInviteRole} disabled={inviting} /> : <p>New teammates receive Staff access. Only an Owner can assign or change workspace roles.</p>}{errorMessage && <PageError message={errorMessage} />}<div className="modal-actions"><Button type="button" variant="secondary" disabled={inviting} onClick={() => setModal(false)}>Cancel</Button><Button type="submit" disabled={inviting}>{inviting ? "Creating..." : "Create invitation"}</Button></div></form>}</Modal>}
   </>;
 }
 

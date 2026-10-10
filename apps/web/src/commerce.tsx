@@ -1,6 +1,7 @@
 import React, { useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { api, dateLabel, money, useLoad } from "./api";
+import { canAccessPage, isAdmin, type Role } from "./roles";
 
 const channels = ["Manual", "TikTok Shop", "Facebook Marketplace", "Facebook Page", "Facebook Messenger", "Instagram", "Shareable Order Link"];
 const carriers = ["J&T Express", "JRS Express", "LBC Express", "Ninja Van", "Flash Express", "SPX Express", "GoGo Xpress", "GrabExpress", "Lalamove"];
@@ -90,7 +91,7 @@ function CustomerFields({ required = false }: { required?: boolean }): React.JSX
   </div>;
 }
 
-function OrderStockCheck({ order }: { order: Order }): React.JSX.Element {
+function OrderStockCheck({ order, canReceive }: { order: Order; canReceive: boolean }): React.JSX.Element {
   const stock = useLoad<{ items: { variantId: string; sku: string; uom: string; locationName: string; quantityOnHand: number; quantityReserved: number; quantityAvailable: number }[] }>(`/stock?locationId=${encodeURIComponent(order.locationId)}`);
   const requirements = new Map<string, { item: Item; quantity: number }>();
   for (const item of order.items) {
@@ -110,7 +111,7 @@ function OrderStockCheck({ order }: { order: Order }): React.JSX.Element {
       const query = new URLSearchParams({ receive: balance?.variantId ?? item.variantId ?? "", locationId: order.locationId, quantity: String(shortage || quantity), orderId: order.id });
       return <li key={key}><strong>{item.description}</strong><p>Required: {quantity} {item.uom} · Available: {available} {balance?.uom ?? item.uom} · Reserved: {balance?.quantityReserved ?? 0} {balance?.uom ?? item.uom}{balance ? ` · ${balance.locationName}` : ""}</p>
         {uomChanged ? <p role="alert">Catalog UOM changed. Cancel and recreate this order with the current UOM.</p>
-          : shortage > 0 && <><p role="alert">Shortage: {shortage} {item.uom}. Receive stock before retrying verification.</p>{(balance || item.variantId) && <Link className="inline-link" to={`/inventory?${query}`}>Receive stock for {item.description}</Link>}</>}
+          : shortage > 0 && <><p role="alert">Shortage: {shortage} {item.uom}. {canReceive ? "Receive stock before retrying verification." : "Ask an inventory controller, owner, or admin to receive stock."}</p>{canReceive && (balance || item.variantId) && <Link className="inline-link" to={`/inventory?${query}`}>Receive stock for {item.description}</Link>}</>}
         {!balance && <p role="alert">No matching inventory balance found. Check the catalog variant and fulfillment location.</p>}
       </li>;
     })}</ul>}
@@ -166,8 +167,8 @@ function CaptureForm({ linkMode, saved }: { linkMode: boolean; saved: (order?: O
   </form>;
 }
 
-export function CommerceOrders({ role }: { role: string }): React.JSX.Element {
-  const links = useLoad<{ items: CheckoutLink[] }>(role === "staff" ? "" : "/checkout-links");
+export function CommerceOrders({ role }: { role: Role }): React.JSX.Element {
+  const links = useLoad<{ items: CheckoutLink[] }>(isAdmin(role) ? "/checkout-links" : "");
   const navigate = useNavigate();
   const [tab, setTab] = useState("orders");
   const [capture, setCapture] = useState<"order" | "link" | null>(null);
@@ -199,10 +200,10 @@ export function CommerceOrders({ role }: { role: string }): React.JSX.Element {
     finally { setBusy(false); }
   };
   return <>
-    <Heading title="Social commerce orders"><button className="button button-primary" onClick={() => setCapture("order")}>New order</button>{role !== "staff" && <button className="button button-secondary" onClick={() => { setTab("links"); setCapture("link"); }}>Create app link</button>}</Heading>
+    <Heading title="Social commerce orders"><button className="button button-primary" onClick={() => setCapture("order")}>New order</button>{isAdmin(role) && <button className="button button-secondary" onClick={() => { setTab("links"); setCapture("link"); }}>Create app link</button>}</Heading>
     <p>One workflow for every channel. Social-platform API capture is not connected; use manual entry, checkout links, or authenticated imports.</p>
     <ErrorBox message={orders.error || links.error || error} />
-    <div className="tabs">{["orders", ...(role !== "staff" ? ["links", "import"] : [])].map((item) => <button key={item} className={tab === item ? "tab active" : "tab"} onClick={() => { setTab(item); setCapture(null); }}>{label(item)}</button>)}</div>
+    <div className="tabs">{["orders", ...(isAdmin(role) ? ["links", "import"] : [])].map((item) => <button key={item} className={tab === item ? "tab active" : "tab"} onClick={() => { setTab(item); setCapture(null); }}>{label(item)}</button>)}</div>
     {capture && <Panel title={capture === "link" ? "Create a shareable checkout link" : "Capture a customer order"}><button className="button button-secondary" onClick={() => setCapture(null)}>Close form</button><CaptureForm linkMode={capture === "link"} saved={(order) => { setCapture(null); orders.reload(); links.reload(); if (order) navigate(`/orders/${order.id}`); }} /></Panel>}
     {tab === "orders" && <Panel title={`Unified inbox (${orders.data?.total ?? 0})`}>
       <div className="form-grid commerce-filters"><label className="field-label">Search orders<input maxLength={200} value={search} onChange={(event) => { setSearch(event.target.value); setPage(1); }} placeholder="Order, customer, external ID" /></label>
@@ -217,7 +218,7 @@ export function CommerceOrders({ role }: { role: string }): React.JSX.Element {
   </>;
 }
 
-export function CommerceOrderDetails({ role }: { role: string }): React.JSX.Element {
+export function CommerceOrderDetails({ role }: { role: Role }): React.JSX.Element {
   const { id } = useParams();
   const order = useLoad<Order>(`/orders/${id}`);
   const [error, setError] = useState("");
@@ -244,23 +245,23 @@ export function CommerceOrderDetails({ role }: { role: string }): React.JSX.Elem
     <Heading title="Order details"><button className="button button-secondary" disabled={!completed || busy || !!order.error} title={completed ? "Preview and print the completed invoice" : "Mark the delivered order completed to enable invoice printing"} onClick={() => window.print()}>Print invoice</button></Heading>
     {!completed && <p className="commerce-no-print">Invoice printing is available after the order is marked completed.</p>}
     <ErrorBox message={order.error || error} />{notice && <div className="success-box" role="status">{notice}</div>}
-    <Panel className="commerce-invoice" title={`Invoice ${data.invoiceNumber}`}><strong>{data.businessName}</strong><p>Issued: {dateLabel(data.createdAt)}</p><p className="mono">{data.orderNumber}</p><p>{data.customerName} · {data.channel}{data.externalId ? ` · ${data.externalId}` : ""}</p><p>{data.customerEmail} {data.customerPhone}</p><p>{data.shippingAddress || "No shipping address yet"}</p>{data.customerId && <Link className="inline-link commerce-no-print" to={`/customers/${data.customerId}`}>View customer profile</Link>}<Items items={data.items} currency={data.currency} /><div className="order-total"><span>Total</span><strong>{money(data.totalMinor, data.currency)}</strong></div><p>Stage: <strong>{label(data.stage)}</strong>. Payment: <strong>{data.refundDue ? "Refund due" : label(data.payments.at(-1)?.status ?? "unpaid")}</strong></p></Panel>
+    <Panel className="commerce-invoice" title={`Invoice ${data.invoiceNumber}`}><strong>{data.businessName}</strong><p>Issued: {dateLabel(data.createdAt)}</p><p className="mono">{data.orderNumber}</p><p>{data.customerName} · {data.channel}{data.externalId ? ` · ${data.externalId}` : ""}</p><p>{data.customerEmail} {data.customerPhone}</p><p>{data.shippingAddress || "No shipping address yet"}</p>{data.customerId && canAccessPage(role, "/customers") && <Link className="inline-link commerce-no-print" to={`/customers/${data.customerId}`}>View customer profile</Link>}<Items items={data.items} currency={data.currency} /><div className="order-total"><span>Total</span><strong>{money(data.totalMinor, data.currency)}</strong></div><p>Stage: <strong>{label(data.stage)}</strong>. Payment: <strong>{data.refundDue ? "Refund due" : label(data.payments.at(-1)?.status ?? "unpaid")}</strong></p></Panel>
     <div className="detail-grid commerce-no-print"><div>
       <Panel title="Workflow"><p>Received → payment verified + stock reserved → packing → shipped + stock deducted → delivered → completed + sale recorded.</p><div className="button-group">
         {next[data.stage] && <button className="button button-primary" disabled={busy} onClick={() => void run("", { stage: next[data.stage] }, "PATCH")}>Mark {label(next[data.stage])}</button>}
         {completed && <button className="button button-primary" disabled>Mark Completed</button>}
         {canCancel && <button className="button button-secondary" disabled={busy} onClick={() => { if (window.confirm("Cancel this order and release its reserved stock? A verified payment will require a manual refund.")) void run("", { stage: "cancelled" }, "PATCH"); }}>Cancel order</button>}
       </div>
-      {data.stage === "received" && <OrderStockCheck order={data} />}
+      {data.stage === "received" && <OrderStockCheck order={data} canReceive={canAccessPage(role, "/inventory")} />}
       {data.stage === "packing" && <ShipmentForm busy={busy} submit={(body) => run("", body, "PATCH")} />}
       <ShipmentDetails carrier={data.carrier} trackingNumber={data.trackingNumber} />
       {canCancel && <><button className="button button-secondary" onClick={() => setShipping(!shipping)}>Edit shipping details</button>{shipping && <form className="modal-form" onSubmit={(event) => fromForm(event, "shipping")}><label className="field-label">Customer phone<input name="customerPhone" defaultValue={data.customerPhone} required maxLength={50} /></label><label className="field-label">Shipping address<textarea name="shippingAddress" defaultValue={data.shippingAddress} required maxLength={1000} /></label><button className="button button-primary" disabled={busy}>Save shipping details</button></form>}</>}
       </Panel>
       <Panel title="Payment validation">{data.payments.map((payment) => <article className="commerce-link-card" key={payment.id}><strong>{payment.method} · {payment.reference}</strong><p>{money(payment.amountMinor, payment.currency)} · {label(payment.status)}</p>{payment.reviewNote && <p>{payment.reviewNote}</p>}</article>)}
         {data.stage === "received" && !pendingPayment && <PaymentForm totalMinor={data.totalMinor} currency={data.currency} busy={busy} submit={(body) => run("payments", body)} />}
-        {pendingPayment && data.stage === "received" && role !== "staff" && <><p>Verify the funds independently before approval. Approval reserves inventory atomically.</p><label className="field-label">Review note / rejection reason<textarea maxLength={1000} value={reviewNote} onChange={(event) => setReviewNote(event.target.value)} /></label><div className="button-group"><button className="button button-primary" disabled={busy} onClick={() => void run("verify-payment", { paymentId: pendingPayment.id, note: reviewNote })}>Verify payment & reserve stock</button><button className="button button-secondary" disabled={busy || !reviewNote.trim()} onClick={() => void run("reject-payment", { paymentId: pendingPayment.id, note: reviewNote })}>Reject payment</button></div></>}
-        {pendingPayment && data.stage === "received" && role === "staff" && <p>An owner or admin must review this payment.</p>}
-        {data.refundDue && role !== "staff" && <form className="modal-form" onSubmit={(event) => fromForm(event, "refund")}><p>Issue the refund outside SellerOne, then record its reference. This does not transfer money.</p><label className="field-label">Refund reference / note<input name="note" required maxLength={1000} /></label><button className="button button-primary" disabled={busy}>Record manual refund</button></form>}
+        {pendingPayment && data.stage === "received" && isAdmin(role) && <><p>Verify the funds independently before approval. Approval reserves inventory atomically.</p><label className="field-label">Review note / rejection reason<textarea maxLength={1000} value={reviewNote} onChange={(event) => setReviewNote(event.target.value)} /></label><div className="button-group"><button className="button button-primary" disabled={busy} onClick={() => void run("verify-payment", { paymentId: pendingPayment.id, note: reviewNote })}>Verify payment & reserve stock</button><button className="button button-secondary" disabled={busy || !reviewNote.trim()} onClick={() => void run("reject-payment", { paymentId: pendingPayment.id, note: reviewNote })}>Reject payment</button></div></>}
+        {pendingPayment && data.stage === "received" && !isAdmin(role) && <p>An owner or admin must review this payment.</p>}
+        {data.refundDue && isAdmin(role) && <form className="modal-form" onSubmit={(event) => fromForm(event, "refund")}><p>Issue the refund outside SellerOne, then record its reference. This does not transfer money.</p><label className="field-label">Refund reference / note<input name="note" required maxLength={1000} /></label><button className="button button-primary" disabled={busy}>Record manual refund</button></form>}
       </Panel>
       <Panel title="Customer communication">{data.trackingPath ? <><ShareLink path={data.trackingPath} /><p>Send this private link to the customer for order confirmation and live status. Do not post it publicly.</p></> : <p>This legacy order has no public tracking link.</p>}
         <p>No automatic email or social message is sent. Prepare a message, send it through your channel, then log it as sent. Sent messages also appear on customer tracking.</p>

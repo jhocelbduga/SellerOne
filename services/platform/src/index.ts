@@ -7,10 +7,12 @@ import { TLSSocket } from "node:tls";
 import { DatabaseSync } from "node:sqlite";
 import nodemailer from "nodemailer";
 import type { Transporter } from "nodemailer";
+import sharp from "sharp";
 import { InventoryError, InventoryStore } from "@sellerone/inventory-service";
 import { CHANNELS, CommerceStore } from "./commerce.js";
 import { BomStore } from "./bom.js";
 import { NotificationStore } from "./notifications.js";
+import { canAccessApi, isRole, migrateWorkspaceRoles, type Role } from "./roles.js";
 
 const scrypt = promisify(scryptCallback);
 const PORT = Number(process.env.PORT ?? 3100);
@@ -32,12 +34,12 @@ const MIME_TYPES: Record<string, string> = {
   ".woff2": "font/woff2",
 };
 
-type Role = "owner" | "admin" | "staff";
 interface User {
   id: string;
   name: string;
   email: string;
   role: Role;
+  avatarUrl: string | null;
 }
 interface AppErrorShape extends Error {
   statusCode?: number;
@@ -99,12 +101,19 @@ function nowIso(): string {
 }
 
 function formatUser(row: Record<string, unknown>): User {
+  if (!isRole(row.role)) throw new Error("Stored workspace role is invalid.");
   return {
     id: String(row.id),
     name: String(row.name),
     email: String(row.email),
-    role: String(row.role) as Role,
+    role: row.role,
+    avatarUrl: profilePictureUrl(String(row.id)),
   };
+}
+
+function profilePictureUrl(userId: string): string | null {
+  const picture = db.prepare("SELECT version FROM user_profile_pictures WHERE user_id = ?").get(userId);
+  return picture ? `/api/profile-pictures/${encodeURIComponent(userId)}?v=${picture.version}` : null;
 }
 
 function currencyCode(value: unknown): string {
@@ -133,7 +142,7 @@ db.exec(`
     name TEXT NOT NULL,
     email TEXT NOT NULL UNIQUE COLLATE NOCASE,
     password_hash TEXT NOT NULL,
-    role TEXT NOT NULL CHECK (role IN ('owner', 'admin', 'staff')),
+    role TEXT NOT NULL CHECK (role IN ('owner', 'admin', 'staff', 'inventory_controller', 'order_processing_specialist', 'customer_relations_representative')),
     active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
     created_at TEXT NOT NULL
   );
@@ -147,7 +156,7 @@ db.exec(`
     token_hash TEXT PRIMARY KEY,
     email TEXT NOT NULL COLLATE NOCASE,
     name TEXT NOT NULL,
-    role TEXT NOT NULL CHECK (role IN ('admin', 'staff')),
+    role TEXT NOT NULL CHECK (role IN ('admin', 'staff', 'inventory_controller', 'order_processing_specialist', 'customer_relations_representative')),
     expires_at TEXT NOT NULL,
     created_at TEXT NOT NULL
   );
@@ -220,9 +229,22 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS expenses_created ON expenses (created_at DESC);
 `);
 
+migrateWorkspaceRoles(db);
 const inventory = new InventoryStore(db);
 const materialBoms = new BomStore(db);
 const notifications = new NotificationStore(db, inventory);
+db.exec(`CREATE TABLE IF NOT EXISTS user_profile_pictures (
+  user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  image BLOB NOT NULL,
+  version TEXT NOT NULL
+)`);
+db.exec(`CREATE TABLE IF NOT EXISTS user_social_links (
+  user_id TEXT NOT NULL REFERENCES users(id),
+  platform TEXT NOT NULL,
+  url TEXT,
+  visible INTEGER NOT NULL DEFAULT 0 CHECK (visible IN (0, 1)),
+  PRIMARY KEY (user_id, platform)
+)`);
 const customerSocialFields = {
   facebookUrl: { column: "facebook_url", label: "Facebook", hosts: ["facebook.com", "fb.com"] },
   instagramUrl: { column: "instagram_url", label: "Instagram", hosts: ["instagram.com"] },
@@ -293,13 +315,13 @@ function parseUser(request: IncomingMessage): User | undefined {
   return row ? formatUser(row) : undefined;
 }
 
-async function readBody(request: IncomingMessage): Promise<Record<string, unknown>> {
+async function readBody(request: IncomingMessage, maxBytes = 1024 * 1024): Promise<Record<string, unknown>> {
   const chunks: Buffer[] = [];
   let size = 0;
   for await (const value of request) {
     const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
     size += chunk.length;
-    if (size > 1024 * 1024) {
+    if (size > maxBytes) {
       throw new AppError("Request body is too large.", 413);
     }
     chunks.push(chunk);
@@ -490,7 +512,7 @@ async function api(
       throw error;
     }
     createSession(id, request, response);
-    sendJson(response, 201, { user: { id, name, email, role: "owner" } });
+    sendJson(response, 201, { user: { id, name, email, role: "owner", avatarUrl: null } });
     return;
   }
 
@@ -532,18 +554,20 @@ async function api(
     const id = randomBytes(16).toString("hex");
     const salt = randomBytes(16);
     const key = await scrypt(passwordValue(body.password), salt, 64) as Buffer;
+    let registered = invitation;
     db.exec("BEGIN IMMEDIATE");
     try {
-      const consumed = db.prepare("DELETE FROM invitations WHERE token_hash = ? AND expires_at > ?")
-        .run(hashToken(token), nowIso());
-      if (Number(consumed.changes) !== 1) {
+      const consumed = db.prepare("DELETE FROM invitations WHERE token_hash = ? AND expires_at > ? RETURNING email, name, role")
+        .get(hashToken(token), nowIso());
+      if (!consumed) {
         throw new AppError("This invitation is invalid or has expired.", 410);
       }
+      registered = consumed;
       db.prepare(`
         INSERT INTO users (id, name, email, password_hash, role, created_at)
         VALUES (?, ?, ?, ?, ?, ?)
-      `).run(id, String(invitation.name), String(invitation.email), `${salt.toString("hex")}:${key.toString("hex")}`,
-        String(invitation.role), nowIso());
+      `).run(id, String(registered.name), String(registered.email), `${salt.toString("hex")}:${key.toString("hex")}`,
+        String(registered.role), nowIso());
       db.exec("COMMIT");
     } catch (error) {
       db.exec("ROLLBACK");
@@ -551,7 +575,7 @@ async function api(
     }
     createSession(id, request, response);
     sendJson(response, 201, {
-      user: { id, name: invitation.name, email: invitation.email, role: invitation.role },
+      user: { id, name: registered.name, email: registered.email, role: registered.role, avatarUrl: null },
     });
     return;
   }
@@ -651,6 +675,77 @@ async function api(
   }
 
   const user = requireUser(parseUser(request));
+  if (!canAccessApi(user.role, path[0], method)) throw new AppError("Your workspace role does not have access to this resource.", 403);
+  if (path[0] === "profile-pictures" && path.length === 2 && method === "GET") {
+    const picture = db.prepare("SELECT p.image FROM user_profile_pictures p JOIN users u ON u.id = p.user_id WHERE p.user_id = ? AND u.active = 1").get(path[1]);
+    if (!picture) throw new AppError("Profile picture not found.", 404);
+    if (!(picture.image instanceof Uint8Array)) throw new Error("Stored profile picture is invalid.");
+    response.writeHead(200, { "content-type": "image/webp", "cache-control": "private, no-store", "x-content-type-options": "nosniff" });
+    response.end(picture.image);
+    return;
+  }
+  if (path[0] === "me" && path[1] === "profile-picture" && path.length === 2) {
+    if (method === "PUT") {
+      const body = await readBody(request, 7 * 1024 * 1024);
+      const match = typeof body.image === "string" ? /^data:image\/(png|jpeg|webp);base64,([A-Za-z0-9+/]+={0,2})$/.exec(body.image) : null;
+      if (!match) throw new AppError("Upload a PNG, JPEG, or WebP image.");
+      const input = Buffer.from(match[2], "base64");
+      if (input.length > 5 * 1024 * 1024) throw new AppError("Profile pictures must be no larger than 5 MB.", 413);
+      if (!input.length || input.toString("base64") !== match[2]) throw new AppError("Image encoding is invalid.");
+      let image: Buffer;
+      try {
+        const decoder = sharp(input, { limitInputPixels: 4096 * 4096, failOn: "warning" });
+        const metadata = await decoder.metadata();
+        if (metadata.format !== match[1] || !metadata.width || !metadata.height || metadata.width > 4096 || metadata.height > 4096 || (metadata.pages ?? 1) !== 1) {
+          throw new AppError("Use a single-frame PNG, JPEG, or WebP image no larger than 4096 x 4096 pixels.");
+        }
+        image = await decoder.rotate().resize(256, 256, { fit: "cover" }).webp({ quality: 85 }).toBuffer();
+      } catch (error) {
+        if (error instanceof AppError) throw error;
+        throw new AppError("The image could not be decoded. Use a valid PNG, JPEG, or WebP image within 4096 x 4096 pixels.");
+      }
+      if (parseUser(request)?.id !== user.id) throw new AppError("Sign in again to update your profile picture.", 401);
+      db.prepare(`INSERT INTO user_profile_pictures (user_id, image, version) VALUES (?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET image = excluded.image, version = excluded.version`)
+        .run(user.id, image, hashToken(image.toString("base64")));
+    } else if (method === "DELETE") {
+      db.prepare("DELETE FROM user_profile_pictures WHERE user_id = ?").run(user.id);
+    } else throw new AppError("Profile picture endpoint not found.", 404);
+    sendJson(response, 200, { user: { ...user, avatarUrl: profilePictureUrl(user.id) } });
+    return;
+  }
+  if (path[0] === "me" && path[1] === "social-links" && path.length === 2) {
+    const platforms = Object.entries(customerSocialFields);
+    const readLinks = () => {
+      const rows = db.prepare("SELECT platform, url, visible FROM user_social_links WHERE user_id = ?").all(user.id);
+      return Object.fromEntries(platforms.map(([field]) => {
+        const row = rows.find((entry) => entry.platform === field);
+        return [field, { url: row?.url ?? null, visible: Boolean(row?.visible) }];
+      }));
+    };
+    if (method === "GET") { sendJson(response, 200, { links: readLinks() }); return; }
+    if (method === "PATCH") {
+      const body = await readBody(request);
+      if (!isRecord(body.links) || !Object.keys(body.links).length) throw new AppError("Provide social links to update.");
+      const updates = Object.entries(body.links).map(([field, value]) => {
+        const config = platforms.find(([key]) => key === field)?.[1];
+        if (!config) throw new AppError("Unsupported social media platform.");
+        if (!isRecord(value) || typeof value.visible !== "boolean") throw new AppError(`${config.label} visibility must be true or false.`);
+        const url = customerSocialUrl(value.url, config.label, config.hosts);
+        if (value.visible && !url) throw new AppError(`Enter a ${config.label} URL before showing it in your profile menu.`);
+        return { field, url, visible: value.visible };
+      });
+      db.exec("BEGIN IMMEDIATE");
+      try {
+        const upsert = db.prepare(`INSERT INTO user_social_links (user_id, platform, url, visible) VALUES (?, ?, ?, ?)
+          ON CONFLICT(user_id, platform) DO UPDATE SET url = excluded.url, visible = excluded.visible`);
+        for (const update of updates) upsert.run(user.id, update.field, update.url, Number(update.visible));
+        db.exec("COMMIT");
+      } catch (error) { db.exec("ROLLBACK"); throw error; }
+      sendJson(response, 200, { links: readLinks() }); return;
+    }
+    throw new AppError("Social links endpoint not found.", 404);
+  }
   if (path[0] === "notifications") {
     if (path.length === 1 && method === "GET") {
       sendJson(response, 200, notifications.list(user.id));
@@ -666,6 +761,40 @@ async function api(
     sendJson(response, 200, { user });
     return;
   }
+  if (path[0] === "me" && (method === "PATCH" || (method === "POST" && path[1] === "password"))) {
+    const body = await readBody(request);
+    const changingPassword = method === "POST" && path.length === 2;
+    if (!changingPassword && path.length !== 1) throw new AppError("Account endpoint not found.", 404);
+    const name = changingPassword ? user.name : text(body.name, "Name");
+    const email = changingPassword ? user.email : emailAddress(body.email);
+    const existing = db.prepare("SELECT password_hash FROM users WHERE id = ? AND active = 1").get(user.id)!;
+    const oldHash = String(existing.password_hash);
+    if (changingPassword || email !== user.email) {
+      if (!await verifyPassword(passwordValue(body.currentPassword), oldHash)) throw new AppError("Current password is incorrect.", 403);
+    }
+    let newHash = oldHash;
+    if (changingPassword) {
+      const password = passwordValue(body.newPassword);
+      if (password === body.currentPassword) throw new AppError("New password must differ from your current password.");
+      const salt = randomBytes(16);
+      const key = await scrypt(password, salt, 64) as Buffer;
+      newHash = `${salt.toString("hex")}:${key.toString("hex")}`;
+    }
+    if (!parseUser(request)) throw new AppError("Sign in again to update your account.", 401);
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const updated = db.prepare("UPDATE users SET name = ?, email = ?, password_hash = ? WHERE id = ? AND active = 1 AND password_hash = ?")
+        .run(name, email, newHash, user.id, oldHash);
+      if (Number(updated.changes) !== 1) throw new AppError("Your account changed during this request. Sign in again and retry.", 409);
+      if (changingPassword || email !== user.email) {
+        db.prepare("DELETE FROM sessions WHERE user_id = ? AND id_hash <> ?").run(user.id, hashToken(cookieToken(request)!));
+        db.prepare("DELETE FROM password_resets WHERE user_id = ?").run(user.id);
+      }
+      db.exec("COMMIT");
+    } catch (error) { db.exec("ROLLBACK"); throw error; }
+    sendJson(response, 200, { user: { ...user, name, email } });
+    return;
+  }
 
   if (path[0] === "users") {
     requireAdmin(user);
@@ -678,17 +807,20 @@ async function api(
         SELECT email, name, role, expires_at AS expiresAt, created_at AS createdAt
         FROM invitations ORDER BY created_at DESC
       `).all();
-      sendJson(response, 200, { items: users, invitations });
+      sendJson(response, 200, { items: users.map((row) => ({ ...row, avatarUrl: row.active ? profilePictureUrl(String(row.id)) : null })), invitations });
       return;
     }
     if (path.length === 1 && method === "POST") {
       const body = await readBody(request);
+      const manager = requireUser(parseUser(request));
+      requireAdmin(manager);
       const email = emailAddress(body.email);
       const name = text(body.name, "Name");
-      const role = body.role ?? "staff";
-      if (role !== "staff" && role !== "admin") {
-        throw new AppError("Invited users can have the admin or staff role.");
-      }
+      if (body.role !== undefined && manager.role !== "owner") throw new AppError("Only owners can assign workspace roles.", 403);
+      const role = body.role === undefined ? "staff" : body.role;
+      if (!isRole(role) || role === "owner") throw new AppError("Choose a valid invited workspace role.");
+      const pending = db.prepare("SELECT role FROM invitations WHERE email = ? COLLATE NOCASE AND expires_at > ?").get(email, nowIso());
+      if (manager.role !== "owner" && pending && pending.role !== "staff") throw new AppError("Only owners can replace an invitation with an assigned role.", 403);
       if (db.prepare("SELECT id FROM users WHERE email = ? COLLATE NOCASE").get(email)) {
         throw new AppError("An account already exists for this email.", 409);
       }
@@ -708,6 +840,8 @@ async function api(
     }
     if (path.length === 2 && method === "PATCH") {
       const body = await readBody(request);
+      const manager = requireUser(parseUser(request));
+      requireAdmin(manager);
       const targetId = path[1];
       const existing = db.prepare("SELECT id, role, active FROM users WHERE id = ?").get(targetId);
       if (!existing) {
@@ -718,10 +852,10 @@ async function api(
         throw new AppError("active must be true or false.");
       }
       const role = body.role;
-      if (role !== undefined && !["owner", "admin", "staff"].includes(String(role))) {
-        throw new AppError("Invalid user role.");
-      }
-      if (targetId === user.id && (active === false || role === "staff")) {
+      if (role !== undefined && manager.role !== "owner") throw new AppError("Only owners can modify workspace roles.", 403);
+      if (role !== undefined && !isRole(role)) throw new AppError("Invalid user role.");
+      if (manager.role !== "owner" && (existing.role === "owner" || existing.role === "admin")) throw new AppError("Only owners can manage owner or admin accounts.", 403);
+      if (targetId === manager.id && (active === false || (role !== undefined && role !== existing.role))) {
         throw new AppError("You cannot deactivate or demote your own account.", 409);
       }
       if (String(existing.role) === "owner" && (active === false || (role !== undefined && role !== "owner"))) {
@@ -734,12 +868,24 @@ async function api(
         UPDATE users SET active = COALESCE(?, active), role = COALESCE(?, role)
         WHERE id = ?
       `).run(active === undefined ? null : Number(active), role === undefined ? null : String(role), targetId);
-      if (active === false) {
+      if (active === false || (role !== undefined && role !== existing.role)) {
         insertSessionRevocation(targetId);
       }
       sendJson(response, 200, { ok: true });
       return;
     }
+  }
+
+  if (path[0] === "invitations" && path.length === 2 && method === "PATCH") {
+    if (user.role !== "owner") throw new AppError("Only owners can modify invitation roles.", 403);
+    const body = await readBody(request);
+    if (requireUser(parseUser(request)).role !== "owner") throw new AppError("Only owners can modify invitation roles.", 403);
+    if (!isRole(body.role) || body.role === "owner") throw new AppError("Choose a valid invited workspace role.");
+    const result = db.prepare("UPDATE invitations SET role = ? WHERE email = ? COLLATE NOCASE AND expires_at > ?")
+      .run(body.role, emailAddress(path[1]), nowIso());
+    if (!result.changes) throw new AppError("Pending invitation not found or expired.", 404);
+    sendJson(response, 200, { ok: true });
+    return;
   }
 
   if (path[0] === "settings") {

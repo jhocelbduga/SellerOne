@@ -58,11 +58,11 @@ export class NotificationStore {
     const items = this.db.prepare(`
       SELECT n.id, n.details_json, n.created_at AS createdAt, r.read_at AS readAt
       FROM stock_notifications n LEFT JOIN notification_reads r ON r.notification_id = n.id AND r.user_id = ?
-      WHERE n.resolved_at IS NULL ORDER BY n.created_at DESC, n.id
+      WHERE n.resolved_at IS NULL AND r.read_at IS NULL ORDER BY n.created_at DESC, n.id
     `).all(userId).map(({ details_json, ...row }) => ({
       ...row, ...JSON.parse(String(details_json)) as Record<string, unknown>, status: row.readAt ? "read" : "unread",
     }));
-    return { items, unreadCount: items.filter((row) => row.status === "unread").length };
+    return { items, unreadCount: items.length };
   }
 
   view(id: string, userId: string): { items: Record<string, unknown>[]; unreadCount: number; notification: Record<string, unknown> } {
@@ -71,6 +71,12 @@ export class NotificationStore {
     if (!entry) throw new InventoryError("Notification is no longer active. Refresh the notification list.", 404);
     this.db.prepare("INSERT OR IGNORE INTO notification_reads (notification_id, user_id, read_at) VALUES (?, ?, ?)").run(id, userId, new Date().toISOString());
     const result = this.list(userId);
-    return { ...result, notification: result.items.find((row) => row.id === id)! };
+    const viewed = this.db.prepare(`
+      SELECT n.id, n.details_json, n.created_at AS createdAt, r.read_at AS readAt
+      FROM stock_notifications n JOIN notification_reads r ON r.notification_id = n.id AND r.user_id = ?
+      WHERE n.id = ?
+    `).get(userId, id)!;
+    const { details_json, ...row } = viewed;
+    return { ...result, notification: { ...row, ...JSON.parse(String(details_json)) as Record<string, unknown>, status: "read" } };
   }
 }

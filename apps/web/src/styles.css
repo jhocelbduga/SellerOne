@@ -63,8 +63,16 @@ button { color: inherit; }
 .avatar-sage { width: 31px; height: 31px; background: #e5e9d8; color: #68785b; }
 .avatar-top { width: 29px; height: 29px; background: #e6eadf; color: #607658; }
 .avatar-customer { width: 33px; height: 33px; background: #f0eadd; color: #9b805c; }
+.avatar img { width: 100%; height: 100%; border-radius: inherit; object-fit: cover; }
+.avatar-profile { width: 112px; height: 112px; background: #e6eadf; color: #607658; font-size: 28px; }
+.profile-avatar-trigger { padding: 0; }
+.profile-picture-preview { display: flex; align-items: center; gap: 18px; margin: 18px 0; }
+.profile-picture-preview p { min-width: 0; overflow-wrap: anywhere; }
+.workspace-role-editor { min-width: 210px; max-width: 290px; display: grid; gap: 8px; white-space: normal; }
 .profile-more { margin-left: auto; }
 .account-options { position: relative; margin-left: auto; }
+.account-options-top { margin-left: 0; }
+.account-options-top .account-panel { position: fixed; bottom: auto; top: 70px; right: 16px; width: min(270px, calc(100vw - 32px)); max-height: calc(100dvh - 86px); overflow-y: auto; }
 .account-panel { position: absolute; bottom: calc(100% + 12px); right: 0; width: 200px; padding: 12px; border: 1px solid #edf0eb; border-radius: 12px; background: #fff; box-shadow: 0 8px 28px rgba(28,47,37,.14); z-index: 1; }
 .account-panel > strong, .account-panel > small { display: block; overflow-wrap: anywhere; }
 .account-panel > small { margin: 4px 0 10px; color: #929b95; font-size: 11px; }

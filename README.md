@@ -308,7 +308,10 @@ separate terminals. The Vite server proxies `/api` requests to the platform API.
 
 On the first visit, create the workspace owner through the one-time setup
 screen. Additional users must be invited by an owner or admin and complete
-registration using the invitation link. Without SMTP, local development
+registration using the invitation link. Only Owners can assign or change roles.
+Admins may invite Staff by omitting `role`; an explicit role assignment is
+rejected for non-Owners, including assignments submitted directly to the API.
+Without SMTP, local development
 displays a reset link directly in the browser and explicitly states that no
 email is sent. The link works only for an active matching account. Configure `SMTP_HOST`,
 `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, and `SMTP_FROM` to send reset emails;
@@ -322,6 +325,41 @@ storage.
 The ellipsis beside the sidebar account name opens account options. Owners and
 admins can open workspace settings; all users can sign out. Click outside the
 panel or press Escape to close it. Sign-out errors are shown without redirecting.
+
+### Workspace roles and invitation permissions
+
+Owner-only selectors appear in **Invite a teammate**, pending invitations, and
+the team list. Staff and Admin remain available alongside:
+
+| Role | Enforced access |
+| --- | --- |
+| Inventory Controller | Product/variant and inventory records, receipts, issues, transfers, adjustments/reconciliation, locations, batches, movements, valuation, and stock alerts; optional BOM read-only |
+| Order Processing Specialist | Order capture, payment submission, shipping details, fulfilment/status transitions, invoice printing, and order communications; read-only product/location/stock/customer lookup for order processing |
+| Customer Relations Representative | Customer records, contacts, support/feedback notes, social links, and existing customer order-history summaries |
+
+Specialized roles cannot access general dashboards, finance, reports, workspace
+settings, or team management. Each starts on its permitted module. All users
+retain their own account details, password, picture, and personal social links.
+Stock notifications are available only to roles with inventory/order access.
+Customer relations does not grant order mutations or access to full order
+details. There is no new support-ticket or enquiry integration.
+Existing Staff access is preserved; this change does not convert Staff into a
+restricted role. Owners/Admins retain normal workspace management, but Admins
+cannot assign roles, replace elevated pending invitations, or manage Owner/Admin
+accounts. Payment verification/rejection, refunds, imports, checkout links, and
+BOM editing remain Owner/Admin-only.
+
+`POST /users` accepts the five invitation roles for Owners; Admins must omit
+`role` and receive Staff invitations. `PATCH /invitations/:email` lets an Owner
+update an unexpired invitation role without replacing its private token.
+Registration uses the stored invitation role, never a role supplied by the
+registrant. `PATCH /users/:id` role changes require an Owner and revoke the
+affected member's sessions. Self-demotion/deactivation and removing the last
+active Owner are blocked. Owners remain protected in the UI.
+SQLite role constraints migrate transactionally, preserving existing users,
+passwords, sessions, invitations, profile data, and foreign-key relationships.
+API authorization enforces restrictions independently of navigation and buttons;
+the standalone inventory service remains internal-only.
 
 The platform and inventory data share `DATABASE_PATH` (default
 `.data/sellerone.sqlite`). Set `DATABASE_PATH` to a persistent writable path for
@@ -499,6 +537,61 @@ section and returns to the dashboard after saving and refreshing workspace
 preferences successfully. Failed saves stay on Settings with an explicit
 error and retain entered values. Team & access opens user management.
 
+The top-right profile avatar opens a Profile Settings menu with Account details,
+Security / password, Preferences, and Sign out. The sidebar account menu links
+to the same personal screens. All signed-in users can manage their own name and
+email at `/profile` and change their password at `/profile#security`. Role and
+other users cannot be edited through the personal API.
+
+Account details start in read-only mode. **Edit Account Details** enables the
+name and email fields; **Save Changes** validates required fields and email
+format, saves the updates, and returns to read-only mode with confirmation.
+**Cancel** discards unsaved account changes. Failed saves keep edit mode and
+entered values with an error message. Social Media Links retain their separate
+save controls.
+
+Account Details includes a **Profile Picture** section. Select an image to
+preview it, then **Save profile picture** to apply it. Change, cancel a pending
+selection, or remove the saved picture independently of name/email changes.
+Saved pictures appear in the header, sidebar, Account Details, and authenticated
+team list. Removal restores initials. Same-account tabs receive picture updates
+through BroadcastChannel; reload a tab if that browser feature is unavailable.
+
+`PUT /me/profile-picture` accepts `{ image: "data:image/...;base64,..." }` for
+PNG, JPEG, or WebP; `DELETE /me/profile-picture` removes only the current user's
+picture. Uploads are limited to 5 MB, single-frame images, and 4096 x 4096 pixels.
+The server decodes and re-encodes a metadata-free, square 256 x 256 WebP avatar.
+Images are persisted in SQLite with the account (not in Git); versioned avatar
+URLs change on replacement. `GET /profile-pictures/:userId` requires a signed-in
+workspace user and serves active users' pictures with private/no-store headers.
+Pictures are not exposed in public checkout or tracking.
+
+`PATCH /me` accepts `name` and `email`; email changes require `currentPassword`.
+`POST /me/password` requires `currentPassword` and `newPassword` (10-200
+characters, different from the current password). Email/password changes
+invalidate other sessions and pending password reset links while preserving
+the current session. Passwords use the existing salted scrypt implementation.
+Profile preferences link owners/admins to existing workspace preferences;
+staff see an explanation instead of restricted controls. No new personal
+preference defaults or unsupported security integrations are introduced.
+
+Account Details also includes Social Media Links for Facebook, Instagram,
+TikTok, WhatsApp, and Website, with labelled platform-specific icons and
+individual **Show in my profile menu** controls. Links are private personal
+shortcuts: visible links appear only in the signed-in user's account menus;
+hidden links remain editable and saved. They are not included in team lists,
+auth status, customer profiles, checkout, or public tracking.
+
+`GET /me/social-links` reads only the current user's links. `PATCH
+/me/social-links` accepts a `links` object keyed by `facebookUrl`,
+`instagramUrl`, `tiktokUrl`, `whatsappUrl`, or `websiteUrl`, each containing
+`url` (HTTPS URL or null) and `visible` (boolean). Platform links validate
+matching hosts; websites allow any HTTPS host. Credentials and non-HTTPS URLs
+are rejected. Updates validate all supplied entries before saving atomically;
+omitted platforms remain unchanged. Clear link removes its URL and hides it.
+Blank visible links are rejected. Links open with noopener/noreferrer.
+TikTok and WhatsApp use labelled music/chat glyphs from the existing icon set.
+
 Customer profiles include an editable Social media links card beside Contact
 on wide screens and stacked on small screens. Facebook, Instagram, TikTok,
 WhatsApp, and Website links are optional, customer-specific, and persist after
@@ -551,8 +644,12 @@ The top-bar bell opens Notification management with a selectable stock
 notification list and a **per-user unread counter**. Viewing an item displays
 product, SKU, location, on-hand quantity, minimum, UOM, creation date, and read
 date; it persistently marks only that user's item read and immediately updates
-the badge. Opening the bell alone does not mark anything read. Read items remain
-selectable while their stock shortage remains active.
+the badge. Opening the bell alone does not mark anything read. Only pending
+unread alerts are listed: viewed or acknowledged items disappear from the list
+without deleting their per-user read history. The viewed details stay visible
+until dismissed; Refresh alerts or reopening the panel clears those details
+and reloads the pending list and count. Refresh never marks unread items read.
+The empty state distinguishes no unread alerts from resolved stock shortages.
 
 Stock notifications are persisted as shortage episodes per variant/location.
 Changing stock or minimum while still low does not reset read status. After
@@ -561,7 +658,8 @@ Inventory mutations and shipment transitions synchronize these episodes; lists
 also synchronize on retrieval. Inactive variants are excluded. Reading never
 changes stock, resolves shortages, verifies payments, or creates financial entries.
 
-`GET /notifications` returns active items and the signed-in user's `unreadCount`.
+`GET /notifications` returns only active unread items and the signed-in user's
+`unreadCount`, equal to the returned pending list length.
 `POST /notifications/:id/view` returns the viewed details plus the updated list
 and count. Repeated views are idempotent; inactive/resolved IDs return an error.
 Read state persists across reloads and sign-ins. Other tabs on the same browser

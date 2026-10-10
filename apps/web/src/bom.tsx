@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { api, useLoad } from "./api";
+import { isAdmin, type Role } from "./roles";
 
 interface MaterialVariant {
   id: string; productName: string; name: string; sku: string; uom: string;
@@ -16,7 +17,7 @@ interface Bom {
 interface BomData { variants: MaterialVariant[]; boms: Bom[] }
 interface DraftComponent { key: number; variantId: string; quantity: string; uom: string }
 
-export function RawMaterialBomPage({ enabled, role }: { enabled: boolean; role: "owner" | "admin" | "staff" }): React.JSX.Element {
+export function RawMaterialBomPage({ enabled, role }: { enabled: boolean; role: Role }): React.JSX.Element {
   const { data, loading, error, reload } = useLoad<BomData>(enabled ? "/raw-material-bom" : "");
   const [selected, setSelected] = useState("");
   const [materialId, setMaterialId] = useState("");
@@ -29,7 +30,7 @@ export function RawMaterialBomPage({ enabled, role }: { enabled: boolean; role: 
   const [problem, setProblem] = useState("");
   const [notice, setNotice] = useState("");
   const [confirmDelete, setConfirmDelete] = useState(false);
-  const canEdit = role !== "staff";
+  const canEdit = isAdmin(role);
   const variants = data?.variants ?? [];
   const materials = variants.filter((variant) => variant.isRawMaterial);
   const outputs = variants.filter((variant) => !variant.isRawMaterial);

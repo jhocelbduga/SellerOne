@@ -7,6 +7,8 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { after, before, describe, it } from "node:test";
+import sharp from "sharp";
+import { migrateWorkspaceRoles } from "../roles.js";
 
 type Row = Record<string, unknown>;
 let child: ChildProcess;
@@ -104,6 +106,314 @@ before(async () => {
 after(async () => { await stop(); rmSync(directory, { recursive: true, force: true }); });
 
 describe("social commerce platform", () => {
+  it("migrates legacy role constraints without losing identities, invitations or foreign-key data", () => {
+    const legacy = new DatabaseSync(join(directory, "legacy-roles.sqlite"));
+    try {
+      legacy.exec(`PRAGMA foreign_keys = ON;
+        CREATE TABLE users (id TEXT PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL UNIQUE COLLATE NOCASE,
+          password_hash TEXT NOT NULL, role TEXT NOT NULL CHECK (role IN ('owner','admin','staff')), active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)), created_at TEXT NOT NULL);
+        CREATE TABLE invitations (token_hash TEXT PRIMARY KEY, email TEXT NOT NULL COLLATE NOCASE, name TEXT NOT NULL,
+          role TEXT NOT NULL CHECK (role IN ('admin','staff')), expires_at TEXT NOT NULL, created_at TEXT NOT NULL);
+        CREATE TABLE sessions (id_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE);
+        CREATE TABLE profile_data (user_id TEXT PRIMARY KEY REFERENCES users(id), data TEXT NOT NULL);
+        INSERT INTO users VALUES ('legacy-owner','Legacy Owner','legacy@example.test','unchanged-hash','owner',1,'2026-01-01');
+        INSERT INTO invitations VALUES ('unchanged-token','invited@example.test','Invited','admin','2099-01-01','2026-01-01');
+        INSERT INTO sessions VALUES ('unchanged-session','legacy-owner');
+        INSERT INTO profile_data VALUES ('legacy-owner','unchanged-profile');`);
+      const beforeUsers = legacy.prepare("SELECT * FROM users").all();
+      const beforeInvitations = legacy.prepare("SELECT * FROM invitations").all();
+      migrateWorkspaceRoles(legacy);
+      assert.deepEqual(legacy.prepare("SELECT * FROM users").all(), beforeUsers);
+      assert.deepEqual(legacy.prepare("SELECT * FROM invitations").all(), beforeInvitations);
+      assert.equal(legacy.prepare("SELECT id_hash FROM sessions").get()?.id_hash, "unchanged-session");
+      assert.equal(legacy.prepare("SELECT data FROM profile_data").get()?.data, "unchanged-profile");
+      assert.equal(legacy.prepare("PRAGMA foreign_keys").get()?.foreign_keys, 1);
+      assert.deepEqual(legacy.prepare("PRAGMA foreign_key_check").all(), []);
+      for (const role of ["inventory_controller", "order_processing_specialist", "customer_relations_representative"]) {
+        legacy.prepare("INSERT INTO users VALUES (?, ?, ?, 'hash', ?, 1, '2026-01-01')").run(role, role, `${role}@example.test`, role);
+        legacy.prepare("INSERT INTO invitations VALUES (?, ?, ?, ?, '2099-01-01', '2026-01-01')").run(role, `${role}@invite.test`, role, role);
+      }
+      assert.throws(() => legacy.prepare("UPDATE users SET role = 'unknown'").run(), /CHECK/);
+      assert.throws(() => legacy.prepare("UPDATE invitations SET role = 'owner'").run(), /CHECK/);
+      migrateWorkspaceRoles(legacy);
+      assert.equal(legacy.prepare("SELECT COUNT(*) AS count FROM users").get()?.count, 4);
+      legacy.prepare("DELETE FROM sessions WHERE user_id = 'legacy-owner'").run();
+      legacy.prepare("DELETE FROM profile_data WHERE user_id = 'legacy-owner'").run();
+      legacy.prepare("INSERT INTO sessions VALUES ('cascade-check','legacy-owner')").run();
+      legacy.prepare("DELETE FROM users WHERE id = 'legacy-owner'").run();
+      assert.equal(legacy.prepare("SELECT COUNT(*) AS count FROM sessions").get()?.count, 0);
+    } finally { legacy.close(); }
+  });
+
+  it("restricts role assignment to owners and enforces specialized workspace access", async () => {
+    const password = "Roles-Test-2026!";
+    const makeAccount = async (role: string) => {
+      const email = `${role}@roles.example.test`;
+      const invite = await request("/users", "POST", { name: role, email, role });
+      assert.equal(invite.status, 201, JSON.stringify(invite.body));
+      const token = new URL(String(invite.body.inviteUrl)).searchParams.get("token");
+      const account = await request("/auth/register", "POST", { token, password, role: "owner" }, "");
+      assert.equal(account.status, 201, JSON.stringify(account.body));
+      assert.equal((account.body.user as Row).role, role);
+      return { email, cookie: account.cookie, user: account.body.user as Row };
+    };
+    const admin = await makeAccount("admin");
+    const controller = await makeAccount("inventory_controller");
+    const processor = await makeAccount("order_processing_specialist");
+    const relations = await makeAccount("customer_relations_representative");
+    const owner = (await request("/me")).body.user as Row;
+    for (const role of ["owner", "invalid", null, 5]) {
+      assert.equal((await request("/users", "POST", { name: "Invalid", email: "invalid-role@example.test", role })).status, 400);
+    }
+    assert.equal((await request("/users", "POST", { name: "Admin Staff", email: "admin-staff@example.test" }, admin.cookie)).status, 201);
+    for (const role of ["staff", "admin", "inventory_controller", "order_processing_specialist", "customer_relations_representative", "owner"]) {
+      assert.equal((await request("/users", "POST", { name: "Blocked", email: "blocked@example.test", role }, admin.cookie)).status, 403);
+      assert.equal((await request(`/users/${controller.user.id}`, "PATCH", { role }, admin.cookie)).status, 403);
+    }
+    assert.equal((await request(`/users/${owner.id}`, "PATCH", { active: false }, admin.cookie)).status, 403);
+    assert.equal((await request(`/users/${admin.user.id}`, "PATCH", { active: false }, admin.cookie)).status, 403);
+    assert.equal((await request(`/users/${owner.id}`, "PATCH", { role: "staff" })).status, 409);
+    assert.equal((await request(`/users/${owner.id}`, "PATCH", { active: false })).status, 409);
+    const pending = await request("/users", "POST", { name: "Pending Specialist", email: "pending-role@example.test", role: "inventory_controller" });
+    assert.equal(pending.status, 201);
+    const pendingPath = "/invitations/pending-role%40example.test";
+    assert.equal((await request("/users", "POST", { name: "Overwrite", email: "pending-role@example.test" }, admin.cookie)).status, 403);
+    assert.equal((await request(pendingPath, "PATCH", { role: "staff" }, admin.cookie)).status, 403);
+    assert.equal((await request(pendingPath, "PATCH", { role: "staff" }, staffCookie)).status, 403);
+    assert.equal((await request(pendingPath, "PATCH", { role: "owner" })).status, 400);
+    assert.equal((await request(pendingPath, "PATCH", { role: "customer_relations_representative" })).status, 200);
+    const registered = await request("/auth/register", "POST", { token: new URL(String(pending.body.inviteUrl)).searchParams.get("token"), password, role: "owner" }, "");
+    assert.equal(registered.status, 201);
+    assert.equal((registered.body.user as Row).role, "customer_relations_representative");
+    assert.equal((await request(pendingPath, "PATCH", { role: "staff" })).status, 404);
+    const commonDenied = ["/dashboard", "/users", "/settings", "/sales", "/expenses", "/accounting/summary", "/reports", "/checkout-links"];
+    for (const account of [controller, processor, relations]) {
+      assert.equal((await request("/me", "GET", undefined, account.cookie)).status, 200);
+      assert.equal((await request("/me/social-links", "GET", undefined, account.cookie)).status, 200);
+      for (const path of commonDenied) assert.equal((await request(path, "GET", undefined, account.cookie)).status, 403, `${account.user.role}: ${path}`);
+      for (const path of ["/users", "/sales", "/expenses", "/checkout-links"]) {
+        assert.equal((await request(path, "POST", {}, account.cookie)).status, 403, `${account.user.role}: POST ${path}`);
+      }
+    }
+    for (const path of ["/products", "/stock", "/locations", "/batches", "/valuation", "/movements", "/alerts/low-stock", "/notifications"]) {
+      assert.equal((await request(path, "GET", undefined, controller.cookie)).status, 200, path);
+    }
+    assert.equal((await request("/orders", "GET", undefined, controller.cookie)).status, 403);
+    assert.equal((await request("/customers", "GET", undefined, controller.cookie)).status, 403);
+    const newProduct = await request("/products", "POST", { name: "Controller product", variants: [{ name: "Stock", uom: "pcs", unitCostMinor: 100, currency: "PHP" }] }, controller.cookie);
+    assert.equal(newProduct.status, 201);
+    const variantId = String((newProduct.body.variants as Row[])[0].id);
+    assert.equal((await request("/stock/in", "POST", { variantId, quantity: 10 }, controller.cookie)).status, 201);
+    assert.equal((await request("/adjustments", "POST", { variantId, countedQuantity: 9, note: "Role reconciliation" }, controller.cookie)).status, 200);
+    for (const path of ["/products", "/locations", "/stock", "/customers", "/orders", "/commerce/channels", "/notifications"]) {
+      assert.equal((await request(path, "GET", undefined, processor.cookie)).status, 200, path);
+    }
+    for (const path of ["/products", "/stock/in", "/stock/out", "/adjustments", "/transfers", "/customers", "/orders/import"]) {
+      assert.equal((await request(path, "POST", {}, processor.cookie)).status, 403, path);
+    }
+    assert.equal((await request(`/variants/${variantId}`, "PATCH", { name: "Blocked" }, processor.cookie)).status, 403);
+    const captured = await request("/orders", "POST", {
+      customerName: "Role Customer", customerPhone: "09123456789", shippingAddress: "Role test address",
+      currency: "PHP", items: [{ variantId, quantity: 2, unitPriceMinor: 500 }],
+    }, processor.cookie);
+    assert.equal(captured.status, 201, JSON.stringify(captured.body));
+    const id = captured.body.id;
+    const submitted = await request(`/orders/${id}/payments`, "POST", { method: "Bank transfer", amountMinor: 1000, currency: "PHP" }, processor.cookie);
+    assert.equal(submitted.status, 200);
+    const paymentId = (submitted.body.payments as Row[])[0].id;
+    for (const action of ["verify-payment", "reject-payment", "refund"]) {
+      assert.equal((await request(`/orders/${id}/${action}`, "POST", { paymentId, note: "Denied" }, processor.cookie)).status, 403);
+    }
+    assert.equal((await request(`/orders/${id}`, "PATCH", { stage: "payment_verified" }, processor.cookie)).status, 409);
+    assert.equal((await request(`/orders/${id}`)).body.stage, "received");
+    assert.equal((await request(`/orders/${id}/verify-payment`, "POST", { paymentId }, admin.cookie)).status, 200);
+    assert.equal((await request(`/orders/${id}/communications`, "POST", { message: "Role status update", status: "prepared" }, processor.cookie)).status, 200);
+    for (const body of [{ stage: "packing" }, { stage: "shipped", carrier: "J&T Express" }, { stage: "delivered" }, { stage: "completed" }]) {
+      assert.equal((await request(`/orders/${id}`, "PATCH", body, processor.cookie)).status, 200, JSON.stringify(body));
+    }
+    assert.equal((await request("/customers", "GET", undefined, relations.cookie)).status, 200);
+    const customer = await request("/customers", "POST", { name: "Relations customer", notes: "Support enquiry" }, relations.cookie);
+    assert.equal(customer.status, 201);
+    assert.equal((await request(`/customers/${customer.body.id}`, "PATCH", { notes: "Feedback received", phone: "09123456789" }, relations.cookie)).status, 200);
+    for (const path of ["/products", "/stock", "/orders", "/notifications", "/raw-material-bom"]) {
+      assert.equal((await request(path, "GET", undefined, relations.cookie)).status, 403, path);
+    }
+    assert.equal((await request(`/orders/${id}`, "PATCH", { stage: "cancelled" }, relations.cookie)).status, 403);
+    assert.equal((await request("/stock/in", "POST", { variantId, quantity: 1 }, relations.cookie)).status, 403);
+    assert.equal((await request("/settings", "PATCH", { rawMaterialBomEnabled: true })).status, 200);
+    assert.equal((await request("/raw-material-bom", "GET", undefined, controller.cookie)).status, 200);
+    assert.equal((await request(`/raw-material-bom/materials/${variantId}`, "PATCH", { isRawMaterial: true }, controller.cookie)).status, 403);
+    assert.equal((await request("/raw-material-bom", "GET", undefined, processor.cookie)).status, 403);
+    assert.equal((await request("/settings", "PATCH", { rawMaterialBomEnabled: false })).status, 200);
+    assert.equal((await request(`/users/${controller.user.id}`, "PATCH", { role: "customer_relations_representative" })).status, 200);
+    assert.equal((await request("/stock", "GET", undefined, controller.cookie)).status, 401);
+    const changedCookie = (await request("/auth/login", "POST", { email: controller.email, password }, "")).cookie;
+    assert.equal((await request("/stock", "GET", undefined, changedCookie)).status, 403);
+    assert.equal((await request("/customers", "GET", undefined, changedCookie)).status, 200);
+    assert.equal((await request("/orders", "GET", undefined, staffCookie)).status, 200);
+    assert.equal((await request("/stock", "GET", undefined, staffCookie)).status, 200);
+    await stop(); await start();
+    ownerCookie = (await request("/auth/login", "POST", { email: "owner@example.test", password: "Commerce-Test-2026!" }, "")).cookie;
+    staffCookie = (await request("/auth/login", "POST", { email: "staff@example.test", password: "Commerce-Staff-2026!" }, "")).cookie;
+    const persisted = await request("/auth/login", "POST", { email: processor.email, password }, "");
+    assert.equal((persisted.body.user as Row).role, "order_processing_specialist");
+    assert.equal((await request("/sales", "GET", undefined, persisted.cookie)).status, 403);
+  });
+
+  it("validates, normalizes and persists own profile pictures and protects private image access", async () => {
+    const owner = (await request("/me")).body.user as Row;
+    const staff = (await request("/me", "GET", undefined, staffCookie)).body.user as Row;
+    assert.equal(owner.avatarUrl, null);
+    assert.equal((await request("/me/profile-picture", "PUT", { image: "bad" }, "")).status, 401);
+    assert.equal((await request("/me/profile-picture", "DELETE", undefined, "")).status, 401);
+    const jpeg = await sharp({ create: { width: 400, height: 200, channels: 3, background: "#6495ed" } })
+      .withMetadata().jpeg().toBuffer();
+    const saved = await request("/me/profile-picture", "PUT", { image: `data:image/jpeg;base64,${jpeg.toString("base64")}`, userId: staff.id });
+    assert.equal(saved.status, 200, JSON.stringify(saved.body));
+    const avatarUrl = String((saved.body.user as Row).avatarUrl);
+    assert.match(avatarUrl, /^\/api\/profile-pictures\/.+\?v=[a-f0-9]{64}$/);
+    assert.equal(((await request("/me", "GET", undefined, staffCookie)).body.user as Row).avatarUrl, null);
+    assert.equal(((await request("/auth/status")).body.user as Row).avatarUrl, avatarUrl);
+    assert.equal(((await request("/users")).body.items as Row[]).find((row) => row.id === owner.id)?.avatarUrl, avatarUrl);
+    assert.equal((await fetch(`${base}${avatarUrl}`)).status, 401);
+    const imageResponse = await fetch(`${base}${avatarUrl}`, { headers: { cookie: staffCookie } });
+    assert.equal(imageResponse.status, 200);
+    assert.equal(imageResponse.headers.get("content-type"), "image/webp");
+    assert.equal(imageResponse.headers.get("cache-control"), "private, no-store");
+    assert.equal(imageResponse.headers.get("x-content-type-options"), "nosniff");
+    const normalized = await sharp(Buffer.from(await imageResponse.arrayBuffer())).metadata();
+    assert.equal(normalized.width, 256);
+    assert.equal(normalized.height, 256);
+    assert.equal(normalized.format, "webp");
+    assert.equal(normalized.exif, undefined);
+    for (const image of [
+      "data:image/svg+xml;base64," + Buffer.from("<svg></svg>").toString("base64"),
+      "data:image/png;base64," + Buffer.from("not an image").toString("base64"),
+      `data:image/png;base64,${jpeg.toString("base64")}`,
+      "data:image/jpeg;base64,%%%%",
+      "https://example.test/avatar.jpg",
+    ]) assert.equal((await request("/me/profile-picture", "PUT", { image })).status, 400);
+    assert.equal((await request("/me/profile-picture", "PUT", { image: "data:image/png;base64," + Buffer.alloc(5 * 1024 * 1024 + 1).toString("base64") })).status, 413);
+    const wide = await sharp({ create: { width: 4097, height: 1, channels: 3, background: "#ffffff" } }).png().toBuffer();
+    assert.equal((await request("/me/profile-picture", "PUT", { image: `data:image/png;base64,${wide.toString("base64")}` })).status, 400);
+    const frames = Buffer.alloc(24);
+    frames.fill(255, 12);
+    const animated = await sharp(frames, { raw: { width: 2, height: 4, channels: 3, pageHeight: 2 } }).webp().toBuffer();
+    assert.equal((await sharp(animated).metadata()).pages, 2);
+    assert.equal((await request("/me/profile-picture", "PUT", { image: `data:image/webp;base64,${animated.toString("base64")}` })).status, 400);
+    assert.equal(((await request("/me")).body.user as Row).avatarUrl, avatarUrl);
+    await stop(); await start();
+    ownerCookie = (await request("/auth/login", "POST", { email: "owner@example.test", password: "Commerce-Test-2026!" }, "")).cookie;
+    staffCookie = (await request("/auth/login", "POST", { email: "staff@example.test", password: "Commerce-Staff-2026!" }, "")).cookie;
+    assert.equal(((await request("/me")).body.user as Row).avatarUrl, avatarUrl);
+    assert.equal((await fetch(`${base}${avatarUrl}`, { headers: { cookie: ownerCookie } })).status, 200);
+    const png = await sharp({ create: { width: 4096, height: 1, channels: 4, background: "#ff0000" } }).png().toBuffer();
+    const replacement = await request("/me/profile-picture", "PUT", { image: `data:image/png;base64,${png.toString("base64")}` });
+    assert.equal(replacement.status, 200);
+    assert.notEqual((replacement.body.user as Row).avatarUrl, avatarUrl);
+    const webp = await sharp(png).webp().toBuffer();
+    const staffPicture = await request("/me/profile-picture", "PUT", { image: `data:image/webp;base64,${webp.toString("base64")}`, userId: owner.id }, staffCookie);
+    assert.equal(staffPicture.status, 200);
+    assert.equal(((await request("/me")).body.user as Row).avatarUrl, (replacement.body.user as Row).avatarUrl);
+    assert.equal((await request("/me/profile-picture", "DELETE", { userId: owner.id }, staffCookie)).status, 200);
+    assert.equal(((await request("/me")).body.user as Row).avatarUrl, (replacement.body.user as Row).avatarUrl);
+    const removed = await request("/me/profile-picture", "DELETE");
+    assert.equal(removed.status, 200);
+    assert.equal((removed.body.user as Row).avatarUrl, null);
+    assert.equal((await request("/me/profile-picture", "DELETE")).status, 200);
+    assert.equal((await fetch(`${base}${avatarUrl}`, { headers: { cookie: ownerCookie } })).status, 404);
+    await stop(); await start();
+    ownerCookie = (await request("/auth/login", "POST", { email: "owner@example.test", password: "Commerce-Test-2026!" }, "")).cookie;
+    staffCookie = (await request("/auth/login", "POST", { email: "staff@example.test", password: "Commerce-Staff-2026!" }, "")).cookie;
+    assert.equal(((await request("/me")).body.user as Row).avatarUrl, null);
+  });
+
+  it("validates personal social URLs and visibility, isolates users and persists links", async () => {
+    assert.equal((await request("/me/social-links", "GET", undefined, "")).status, 401);
+    const initial = (await request("/me/social-links")).body.links as Row;
+    assert.deepEqual(initial.facebookUrl, { url: null, visible: false });
+    const links = {
+      facebookUrl: { url: " https://www.facebook.com/test-owner ", visible: true },
+      instagramUrl: { url: "https://www.instagram.com/test-owner", visible: false },
+      tiktokUrl: { url: "https://www.tiktok.com/@test-owner", visible: true },
+      whatsappUrl: { url: "https://wa.me/12025550101", visible: true },
+      websiteUrl: { url: "https://example.test", visible: false },
+    };
+    const saved = await request("/me/social-links", "PATCH", { links });
+    assert.equal(saved.status, 200);
+    assert.deepEqual((saved.body.links as Row).facebookUrl, { url: "https://www.facebook.com/test-owner", visible: true });
+    for (const bad of [
+      { facebookUrl: { url: "http://facebook.com/test", visible: true } },
+      { facebookUrl: { url: "https://facebook.com.evil.test", visible: true } },
+      { instagramUrl: { url: "https://facebook.com/test", visible: true } },
+      { websiteUrl: { url: "https://user:pass@example.test", visible: true } },
+      { websiteUrl: { url: "javascript:alert(1)", visible: true } },
+      { facebookUrl: { url: null, visible: true } },
+      { facebookUrl: { url: "https://facebook.com/test", visible: "true" } },
+      { unsupported: { url: "https://example.test", visible: true } },
+    ]) assert.equal((await request("/me/social-links", "PATCH", { links: bad })).status, 400);
+    assert.deepEqual((await request("/me/social-links")).body, saved.body);
+    const atomic = await request("/me/social-links", "PATCH", { links: {
+      facebookUrl: { url: null, visible: false }, instagramUrl: { url: "https://wrong.test", visible: true },
+    } });
+    assert.equal(atomic.status, 400);
+    assert.deepEqual((await request("/me/social-links")).body, saved.body);
+    assert.deepEqual((await request("/me/social-links", "GET", undefined, staffCookie)).body.links, initial);
+    assert.ok(!JSON.stringify((await request("/users")).body).includes("test-owner"));
+    assert.ok(!JSON.stringify((await request("/auth/status")).body).includes("test-owner"));
+    await stop(); await start();
+    ownerCookie = (await request("/auth/login", "POST", { email: "owner@example.test", password: "Commerce-Test-2026!" }, "")).cookie;
+    staffCookie = (await request("/auth/login", "POST", { email: "staff@example.test", password: "Commerce-Staff-2026!" }, "")).cookie;
+    assert.deepEqual((await request("/me/social-links")).body, saved.body);
+    const cleared = await request("/me/social-links", "PATCH", { links: { facebookUrl: { url: null, visible: false } } });
+    assert.equal(cleared.status, 200);
+    assert.deepEqual((cleared.body.links as Row).facebookUrl, { url: null, visible: false });
+    assert.deepEqual((cleared.body.links as Row).instagramUrl, links.instagramUrl);
+  });
+
+  it("updates only the signed-in profile and securely changes passwords while revoking other sessions", async () => {
+    const invite = await request("/users", "POST", { name: "Profile Test", email: "profile@example.test", role: "staff" });
+    const token = new URL(String(invite.body.inviteUrl)).searchParams.get("token");
+    const registered = await request("/auth/register", "POST", { token, password: "Profile-Original-2026!" }, "");
+    assert.equal(registered.status, 201);
+    const cookie = registered.cookie;
+    const other = (await request("/auth/login", "POST", { email: "profile@example.test", password: "Profile-Original-2026!" }, "")).cookie;
+    const ownerBefore = (await request("/me")).body;
+    assert.equal((await request("/me", "PATCH", { name: "Updated", email: "profile@example.test" }, "")).status, 401);
+    assert.equal((await request("/me", "PATCH", { name: "", email: "profile@example.test" }, cookie)).status, 400);
+    assert.equal((await request("/me", "PATCH", { name: "Updated", email: "bad" }, cookie)).status, 400);
+    assert.equal((await request("/me", "PATCH", { name: "Updated", email: "changed@example.test", currentPassword: "Wrong-Password-2026!" }, cookie)).status, 403);
+    assert.equal((await request("/me", "PATCH", { name: "Updated", email: "owner@example.test", currentPassword: "Profile-Original-2026!" }, cookie)).status, 409);
+    const renamed = await request("/me", "PATCH", { name: "Updated Profile", email: "profile@example.test", role: "owner" }, cookie);
+    assert.equal(renamed.status, 200);
+    assert.equal((renamed.body.user as Row).role, "staff");
+    assert.equal((await request("/me", "GET", undefined, other)).status, 200);
+    const changedEmail = await request("/me", "PATCH", { name: "Updated Profile", email: "changed@example.test", currentPassword: "Profile-Original-2026!" }, cookie);
+    assert.equal(changedEmail.status, 200);
+    assert.equal((await request("/me", "GET", undefined, other)).status, 401);
+    assert.equal((await request("/auth/login", "POST", { email: "profile@example.test", password: "Profile-Original-2026!" }, "")).status, 401);
+    const second = (await request("/auth/login", "POST", { email: "changed@example.test", password: "Profile-Original-2026!" }, "")).cookie;
+    await request("/auth/forgot-password", "POST", { email: "changed@example.test" }, "");
+    assert.equal((await request("/me/password", "POST", { currentPassword: "Wrong-Password-2026!", newPassword: "Profile-New-2026!" }, cookie)).status, 403);
+    assert.equal((await request("/me/password", "POST", { currentPassword: "Profile-Original-2026!", newPassword: "short" }, cookie)).status, 400);
+    assert.equal((await request("/me/password", "POST", { currentPassword: "Profile-Original-2026!", newPassword: "Profile-Original-2026!" }, cookie)).status, 400);
+    assert.equal((await request("/me/password", "POST", { currentPassword: "Profile-Original-2026!", newPassword: "Profile-New-2026!" }, cookie)).status, 200);
+    assert.equal((await request("/me", "GET", undefined, cookie)).status, 200);
+    assert.equal((await request("/me", "GET", undefined, second)).status, 401);
+    assert.deepEqual((await request("/me")).body, ownerBefore);
+    assert.equal((await request("/auth/login", "POST", { email: "changed@example.test", password: "Profile-Original-2026!" }, "")).status, 401);
+    assert.equal((await request("/auth/login", "POST", { email: "changed@example.test", password: "Profile-New-2026!" }, "")).status, 200);
+    await stop(); await start();
+    ownerCookie = (await request("/auth/login", "POST", { email: "owner@example.test", password: "Commerce-Test-2026!" }, "")).cookie;
+    staffCookie = (await request("/auth/login", "POST", { email: "staff@example.test", password: "Commerce-Staff-2026!" }, "")).cookie;
+    const persisted = await request("/auth/login", "POST", { email: "changed@example.test", password: "Profile-New-2026!" }, "");
+    assert.equal(persisted.status, 200);
+    assert.equal((persisted.body.user as Row).name, "Updated Profile");
+    const database = new DatabaseSync(databasePath);
+    assert.equal(database.prepare("SELECT COUNT(*) AS count FROM password_resets WHERE user_id = ?").get((persisted.body.user as Row).id as string)?.count, 0);
+    database.close();
+  });
+
   it("persists per-user notification reads and creates new unread episodes only after recovery", async () => {
     const created = await request("/products", "POST", { name: "Notification coffee", variants: [
       { name: "Large", sku: "NOTIFICATION-TEST", uom: "cup", unitCostMinor: 0, currency: "PHP", reorderPoint: 10 },
@@ -122,6 +432,12 @@ describe("social commerce platform", () => {
     assert.equal(viewed.status, 200);
     assert.equal(viewed.body.unreadCount, Number(list.unreadCount) - 1);
     assert.equal((viewed.body.notification as Row).status, "read");
+    assert.ok(!(viewed.body.items as Row[]).some((item) => item.id === notification.id));
+    assert.equal(viewed.body.unreadCount, (viewed.body.items as Row[]).length);
+    const refreshed = (await request("/notifications")).body;
+    assert.ok(!(refreshed.items as Row[]).some((item) => item.id === notification.id));
+    assert.equal(refreshed.unreadCount, (refreshed.items as Row[]).length);
+    assert.ok((refreshed.items as Row[]).every((item) => item.status === "unread"));
     assert.ok((viewed.body.notification as Row).readAt);
     const readAt = (viewed.body.notification as Row).readAt;
     const repeated = await request(`/notifications/${notification.id}/view`, "POST");
@@ -133,16 +449,18 @@ describe("social commerce platform", () => {
     assert.equal((await request(`/notifications/${notification.id}/view`, "POST", undefined, staffCookie)).status, 200);
     assert.equal((await request(`/notifications/missing/view`, "POST")).status, 404);
     await request("/stock/in", "POST", { variantId, quantity: 10, uom: "cup" });
-    const stillLow = ((await request("/notifications")).body.items as Row[]).find((item) => item.variantId === variantId)!;
+    assert.ok(!((await request("/notifications")).body.items as Row[]).some((item) => item.variantId === variantId));
+    const stillLow = (await request(`/notifications/${notification.id}/view`, "POST")).body.notification as Row;
     assert.equal(stillLow.id, notification.id);
     assert.equal(stillLow.status, "read");
     assert.equal(stillLow.quantityOnHand, 10);
     await request(`/variants/${variantId}`, "PATCH", { reorderPoint: 11 });
-    assert.equal(((await request("/notifications")).body.items as Row[]).find((item) => item.variantId === variantId)?.status, "read");
+    assert.ok(!((await request("/notifications")).body.items as Row[]).some((item) => item.variantId === variantId));
     await stop(); await start();
     ownerCookie = (await request("/auth/login", "POST", { email: "owner@example.test", password: "Commerce-Test-2026!" }, "")).cookie;
     staffCookie = (await request("/auth/login", "POST", { email: "staff@example.test", password: "Commerce-Staff-2026!" }, "")).cookie;
-    assert.equal(((await request("/notifications")).body.items as Row[]).find((item) => item.id === notification.id)?.readAt, readAt);
+    assert.ok(!((await request("/notifications")).body.items as Row[]).some((item) => item.id === notification.id));
+    assert.equal(((await request(`/notifications/${notification.id}/view`, "POST")).body.notification as Row).readAt, readAt);
     await request("/stock/in", "POST", { variantId, quantity: 2, uom: "cup" });
     // Recovery and a new shortage occur between list requests.
     await request("/stock/out", "POST", { variantId, quantity: 2, uom: "cup" });
