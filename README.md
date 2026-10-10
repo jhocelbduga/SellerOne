@@ -33,6 +33,112 @@ growth.
 
 ## Core Features
 
+### Owner-only Product Information Sheets
+
+Catalogue cards include **View Product** and, for Workspace Owners only,
+**Edit Product**. Owners alone create products, modify product/variant fields,
+and manage BOM catalogue classifications/structures. Admins, Staff and
+Inventory Controllers retain their authorised inventory receiving, movements
+and reconciliation, but cannot modify catalogue records. This restriction is
+enforced by the platform API, not just hidden controls.
+
+The Product Information Sheet edits every existing variant, specifications,
+descriptions, prices, UOM and stock-planning levels, variant status, up to 20
+unique categories, and up to three product images. Images are authenticated,
+PNG/JPEG/WebP only, at most 5 MB and 4096 x 4096 pixels per image, single-frame,
+decoded/re-encoded as WebP with metadata stripped. Categories and images are
+optional and do not change the standard catalogue or stock classifications.
+
+Required fields are product name and, per variant, name, SKU, UOM, currency,
+unit cost and minimum stock. Selling price remains optional (blank means manual
+pricing; zero is an explicit free price); medium/maximum targets, descriptions,
+specifications, categories and images remain optional. Inline validation and
+actionable warnings disable **Save Changes** until valid. Completion status is
+**Missing Required Information**, **In Progress** for valid unsaved changes, or
+**Complete** for a valid saved record.
+
+**Cancel Changes** and **Reset** discard edits after confirmation. Owner drafts
+autosave on the current device/browser, keyed to the signed-in user and product,
+and recover in edit mode; drafts do not modify server data. Storage failures are
+explicitly reported. Unsaved edits warn on link navigation or browser unload.
+Successful saves clear the draft and show confirmation. Drafts whose saved
+product version has changed are not automatically applied; concurrent edits
+are rejected with a reload/review message rather than overwriting newer data.
+The full-sheet API
+`PUT /products/:id/sheet` commits product, all variants, categories and images
+atomically, rolling back validation failures. Historical UOM locks and currency
+restrictions remain enforced. Current quantities are read-only on the sheet;
+use inventory operations to change physical stock.
+
+### Controlled Product Retirement
+
+Owners and Admins can **Delete Product**, **Archive Product** or **Deactivate
+Product** from each catalogue card's contextual ellipsis menu and product details.
+Cards always display a labelled, colour-coded **Lifecycle Status** badge.
+The menu groups View Product, Owner-only Edit Product, View Status History,
+and authorised retirement/restore actions. It supports keyboard navigation,
+Escape, outside-click dismissal and focus return after cancelling a dialog.
+Admins have this narrow
+lifecycle permission only; ordinary catalogue editing remains Owner-only.
+Delete is soft retirement, never permanent removal. A predefined business
+reason and explicit confirmation are mandatory; **Other** requires comments.
+Archive sets Archived; Deactivate sets Discontinued. Delete maps End of Life,
+Phase-Out and Discontinued reasons to those statuses; other reasons archive.
+Phase-Out remains orderable. End of Life, Discontinued and Archived block new
+orders and checkout purchases, while existing orders and inventory operations
+continue normally. Product details, images, categories, BOMs and transactions
+are retained. Restore returns a product to Active with a required explanation
+without changing individual variant status.
+
+The dedicated `GET/POST /product-lifecycle/:id` endpoint exposes history and
+validated transitions. Direct product status changes through PATCH or the
+information sheet are rejected. Status, product availability, audit events and
+stakeholder notifications commit atomically, with stale-status checks and
+idempotent transaction keys. Product details show the status history, including
+product ID/name, reason, action, previous/new status, acting user ID/name/role,
+timestamp, comments and transaction ID.
+
+Active Owners, Admins and Inventory Controllers at the time of the change
+receive in-app lifecycle alerts independently of inventory-alert recipient
+preferences. The bell merges pending unread stock and lifecycle notifications.
+Viewing acknowledges only the current user's alert and refreshes its unread
+badge. No email or permanent deletion occurs. Legacy inactive products appear
+as Archived without fabricated historical audit events.
+
+### Guided Order Processing
+
+Order creation is organised into Customer & delivery, Items & pricing, and
+Review & create sections, with live line totals and an order total. Creation
+opens order details for the next payment step; it does not reserve stock.
+The inbox provides quick stage filters, clear/reset and refresh controls, and
+role-aware next-action links. Order details highlight the next required action
+and show lifecycle progress. Missing delivery details are surfaced before
+dispatch, while communication and tracking tools are expandable.
+
+The workflow remains Received → payment verified + stock reserved → packing →
+shipped + stock deducted → delivered → completed + sale recorded.
+Only Owners/Admins verify or reject payment and record manual refunds.
+Inventory availability is rechecked atomically by the server; the interface
+does not bypass shortages, shipping requirements, or invoice-printing rules.
+
+### Workspace Header Search
+
+The sidebar **My workspace** button opens the current-workspace menu. Owners and
+Administrators can view saved business details and open Business details,
+Settings or Team & access. Other roles see their role and their workspace home,
+without restricted settings links or requests. The menu closes on navigation,
+outside click, focus leaving the menu or Escape. SellerOne currently has one
+workspace; this menu does not switch accounts or create additional workspaces.
+
+Use the header **Search** button, **Ctrl+K**, or **Command+K** to find products
+by name, variant name or SKU; orders by order number, customer or external ID;
+customers by name, email or phone; and accessible workspace pages. Results link
+to the corresponding record. When more than eight matches exist in a record
+group, **View all** opens the full list with the search filter retained.
+Search respects workspace page permissions, including specialist roles and the
+optional Raw Material BOM setting. Escape, the close button or a backdrop click
+closes the dialog. Loading failures are shown with a retry action.
+
 ### 1. Inventory Management
 
 Simplify inventory tracking and stock control with real-time visibility.
@@ -333,7 +439,7 @@ the team list. Staff and Admin remain available alongside:
 
 | Role | Enforced access |
 | --- | --- |
-| Inventory Controller | Product/variant and inventory records, receipts, issues, transfers, adjustments/reconciliation, locations, batches, movements, valuation, and stock alerts; optional BOM read-only |
+| Inventory Controller | Read-only product/variant catalogue; inventory receipts, issues, transfers, adjustments/reconciliation, locations, batches, movements, valuation, and stock alerts; optional BOM read-only |
 | Order Processing Specialist | Order capture, payment submission, shipping details, fulfilment/status transitions, invoice printing, and order communications; read-only product/location/stock/customer lookup for order processing |
 | Customer Relations Representative | Customer records, contacts, support/feedback notes, social links, and existing customer order-history summaries |
 
@@ -667,7 +773,7 @@ unit conversion, production, costing, stock deduction, or changes to order
 fulfillment are enabled. Existing recipe attributes are not imported or changed.
 Stock receipts remain whole-number quantities under existing inventory rules.
 
-Owners/admins classify materials and save or delete structures; staff can view.
+Only Owners classify materials and save or delete structures; other authorised roles can view.
 Referenced materials cannot be unclassified until removed from their BOMs, and
 a BOM output cannot become a material until its BOM is deleted. Saves validate
 all components before atomically replacing the structure. Saved UOM snapshots

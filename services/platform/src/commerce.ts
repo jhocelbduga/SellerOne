@@ -296,7 +296,7 @@ export class CommerceStore {
             .run(String(variant.id), String(variant.uom), id, String(item.sku));
           return { variantId: String(variant.id), locationId: String(order.location_id), quantity: Number(item.quantity) };
         });
-        this.inventory.reserveStock(id, reservations);
+        this.inventory.reserveStock(id, reservations, { allowInactiveProduct: true });
         this.setStage(id, "payment_verified");
       }
       this.db.prepare(`UPDATE order_payments SET status = ?, review_note = ?, reviewed_by = ?, reviewed_at = ? WHERE id = ?`)

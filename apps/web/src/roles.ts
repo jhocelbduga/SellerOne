@@ -14,6 +14,7 @@ export function homePath(role: Role): string {
   return role === "inventory_controller" ? "/inventory" : role === "order_processing_specialist" ? "/orders" : role === "customer_relations_representative" ? "/customers" : "/";
 }
 export function canAccessPage(role: Role, pathname: string): boolean {
+  if (pathname === "/products/new") return role === "owner";
   const resource = pathname.split("/")[1];
   if (resource === "profile") return true;
   if (resource === "settings" || resource === "users") return isAdmin(role);

@@ -316,14 +316,14 @@ export class InventoryStore {
     if (this.ownsDatabase) this.database.close();
   }
 
-  reserveStock(orderId: string, items: { variantId: string; locationId: string; quantity: number }[]): void {
+  reserveStock(orderId: string, items: { variantId: string; locationId: string; quantity: number }[], options: { allowInactiveProduct?: boolean } = {}): void {
     this.transaction(() => {
       if (this.database.prepare("SELECT 1 FROM stock_reservations WHERE order_id = ?").get(orderId)) {
         throw new InventoryError("This order already has reserved stock.", 409);
       }
       for (const item of items) {
         const variant = this.inventoryVariant(item.variantId);
-        if (Number(variant.active) !== 1 || Number(variant.product_active) !== 1) {
+        if (Number(variant.active) !== 1 || (Number(variant.product_active) !== 1 && !options.allowInactiveProduct)) {
           throw new InventoryError("Inactive variants cannot be reserved.", 409);
         }
         const locationId = this.locationId(item.locationId);
@@ -557,10 +557,10 @@ export class InventoryStore {
     return this.getProduct(String(variant.productId));
   }
 
-  stockIn(input: StockInput): object {
+  stockIn(input: StockInput, options: { allowInactiveProduct?: boolean } = {}): object {
     const quantity = positiveInteger(input.quantity, "quantity");
     const variant = this.inventoryVariant(input.variantId);
-    if (Number(variant.active) !== 1 || Number(variant.product_active) !== 1) {
+    if (Number(variant.active) !== 1 || (Number(variant.product_active) !== 1 && !options.allowInactiveProduct)) {
       throw new InventoryError("Stock cannot be received for an inactive product or variant.", 409);
     }
     const locationId = this.locationId(input.locationId);

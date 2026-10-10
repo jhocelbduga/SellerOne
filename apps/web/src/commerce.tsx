@@ -1,5 +1,5 @@
-import React, { useState } from "react";
-import { Link, useNavigate, useParams } from "react-router-dom";
+import React, { useEffect, useState } from "react";
+import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
 import { api, dateLabel, money, useLoad } from "./api";
 import { canAccessPage, isAdmin, type Role } from "./roles";
 
@@ -29,6 +29,22 @@ interface CheckoutLink { id: string; title: string; channel: string; active: num
 interface Offer { title: string; currency: string; expiresAt: string; items: { variantId: string; description: string; uom: string; unitPriceMinor: number; maxQuantity: number }[] }
 
 function label(value: string): string { return value.replaceAll("_", " ").replace(/^\w/, (letter) => letter.toUpperCase()); }
+function orderGuidance(order: Pick<Order, "stage" | "paymentStatus" | "refundDue">, role: Role): { title: string; description: string; target?: string } {
+  if (order.refundDue || order.paymentStatus === "refund_due") return { title: isAdmin(role) ? "Record the manual refund" : "Await Owner / Admin refund", description: "The order is cancelled. Refund the customer outside SellerOne, then an Owner or Admin records the reference.", target: "order-payment" };
+  if (order.stage === "received") {
+    if (order.paymentStatus === "submitted") return { title: isAdmin(role) ? "Verify payment & reserve stock" : "Await payment verification", description: isAdmin(role) ? "Check the funds independently and confirm stock availability before approving. Approval reserves stock; it does not deduct stock." : "An Owner or Admin must verify payment. Ask inventory staff to resolve shortages before approval.", target: "order-payment" };
+    return { title: order.paymentStatus === "rejected" ? "Submit a corrected payment reference" : "Submit payment reference", description: "Record the full payment amount and reference for Owner / Admin review. Creating an order does not reserve stock.", target: "order-payment" };
+  }
+  const guidance: Record<string, { title: string; description: string; target?: string }> = {
+    payment_verified: { title: "Start packing", description: "Payment is verified and stock is reserved. Pick and pack the order before dispatch." },
+    packing: { title: "Prepare and dispatch shipment", description: "Confirm the phone and address, select a carrier, then dispatch. Dispatch deducts the reserved stock once.", target: "order-fulfillment" },
+    shipped: { title: "Confirm delivery", description: "Mark delivered only after the customer receives the order." },
+    delivered: { title: "Complete order & record sale", description: "Confirm fulfilment is finished. Completion records the sale once and enables invoice printing." },
+    completed: { title: "Order complete", description: "The sale has been recorded. You can print the invoice or review the order history." },
+    cancelled: { title: "Order cancelled", description: "No further fulfilment actions are required. Any reserved stock has been released." },
+  };
+  return guidance[order.stage] ?? { title: "Review order status", description: "Review the timeline before proceeding." };
+}
 function ErrorBox({ message }: { message: string }): React.JSX.Element | null {
   return message ? <div className="error-box" role="alert">{message}</div> : null;
 }
@@ -145,12 +161,17 @@ function CaptureForm({ linkMode, saved }: { linkMode: boolean; saved: (order?: O
     } catch (caught) { setError(caught instanceof Error ? caught.message : "Could not save."); }
     finally { setBusy(false); }
   };
-  return <form className="modal-form" onSubmit={(event) => void submit(event)}>
+  return <form className="modal-form order-capture-form" onSubmit={(event) => void submit(event)}>
     <ErrorBox message={products.error || locations.error || customers.error || error} />
+    {!linkMode && <div className="order-create-intro"><h3>Create an order in one screen</h3><p>1. Customer &amp; delivery → 2. Items &amp; pricing → 3. Review &amp; create. Payment verification comes after creation.</p></div>}
+    <fieldset className="order-form-section"><legend>{linkMode ? "Offer details" : "1. Customer & delivery"}</legend>
     {linkMode ? <div className="form-grid"><label className="field-label">Link title<input name="title" required maxLength={200} /></label><label className="field-label">Valid for (days)<input name="validDays" type="number" min={1} max={90} defaultValue={7} required /></label></div>
       : <><label className="field-label">Existing customer<select value={customerId} onChange={(event) => setCustomerId(event.target.value)}><option value="">Create customer from details below</option>{customers.data?.items.map((customer) => <option key={customer.id} value={customer.id}>{customer.name}</option>)}</select></label>{!customerId && <CustomerFields />}<label className="field-label">External order ID (optional)<input name="externalId" maxLength={150} placeholder="Used to detect duplicate channel orders" /></label></>}
     <div className="form-grid"><label className="field-label">Source channel<select name="channel" defaultValue={linkMode ? "Shareable Order Link" : "Manual"}>{channels.map((channel) => <option key={channel}>{channel}</option>)}</select></label>
       <label className="field-label">Fulfillment location<select name="locationId" required>{locations.data?.items.map((location) => <option key={location.id} value={location.id}>{location.name}</option>)}</select></label></div>
+    {!linkMode && <small>Phone and shipping address can be added later, but both are required before dispatch. Existing customers use their saved contact details.</small>}
+    </fieldset>
+    <fieldset className="order-form-section"><legend>{linkMode ? "Offer items" : "2. Items & pricing"}</legend>
     {lines.map((line, index) => <div className="commerce-cart-line" key={line.key}>
       <label className="field-label">Product {index + 1}<select required value={line.variantId} onChange={(event) => {
         const variant = variants.find((variant) => variant.id === event.target.value);
@@ -159,24 +180,35 @@ function CaptureForm({ linkMode, saved }: { linkMode: boolean; saved: (order?: O
       <div className="form-grid">{!linkMode && <label className="field-label">Quantity<input type="number" required min={1} step={1} value={line.quantity} onChange={(event) => edit(line.key, { quantity: event.target.value })} /></label>}
         <label className="field-label">Selling price per UOM<input required type="number" min={0} step="0.01" value={line.price} onChange={(event) => edit(line.key, { price: event.target.value })} /><small>Auto-filled from the selected variant's saved price. Override for this {linkMode ? "offer" : "order"} only. Switching products resets the price; variants without a saved price require manual entry.</small></label></div>
       {lines.length > 1 && <button className="button button-secondary" type="button" onClick={() => setLines((current) => current.filter((item) => item.key !== line.key))}>Remove item {index + 1}</button>}
+      {!linkMode && <small className="order-line-total">Line total: {money(Number(line.quantity) * Math.round(Number(line.price) * 100), currency)}</small>}
     </div>)}
     <button className="button button-secondary" type="button" disabled={lines.length >= 50} onClick={() => setLines((current) => [...current, { key: crypto.randomUUID(), variantId: "", quantity: "1", price: "" }])}>Add another item</button>
-    {!linkMode && <><strong>Order total: {money(totalMinor, currency)}</strong><label className="field-label">Internal notes<textarea name="notes" maxLength={2000} /></label></>}
+    </fieldset>
+    {!linkMode && <fieldset className="order-form-section"><legend>3. Review & create</legend><div className="order-capture-total" aria-live="polite"><span>{lines.length} {lines.length === 1 ? "item line" : "item lines"} · {currency}</span><strong>Order total: {money(totalMinor, currency)}</strong></div><label className="field-label">Internal notes (optional)<textarea name="notes" maxLength={2000} /></label></fieldset>}
     <p className="form-footnote">{linkMode ? "Customers choose quantities. Prices come from this link; catalog costs are never exposed. No payment gateway is connected." : "Orders begin at received. Stock is reserved only after payment verification, and deducted at dispatch."}</p>
-    <button className="button button-primary" disabled={busy || products.loading || locations.loading}>{busy ? "Saving..." : linkMode ? "Create checkout link" : "Create order"}</button>
+    <button className="button button-primary" disabled={busy || products.loading || locations.loading || customers.loading || !!products.error || !!locations.error || !!customers.error}>{busy ? "Saving..." : linkMode ? "Create checkout link" : "Create order & continue to payment"}</button>
   </form>;
 }
 
 export function CommerceOrders({ role }: { role: Role }): React.JSX.Element {
+  const location = useLocation();
   const links = useLoad<{ items: CheckoutLink[] }>(isAdmin(role) ? "/checkout-links" : "");
   const navigate = useNavigate();
   const [tab, setTab] = useState("orders");
   const [capture, setCapture] = useState<"order" | "link" | null>(null);
-  const [search, setSearch] = useState("");
+  const [search, setSearch] = useState(() => new URLSearchParams(location.search).get("search") ?? "");
   const [stage, setStage] = useState("all");
   const [channel, setChannel] = useState("all");
   const [payment, setPayment] = useState("all");
   const [page, setPage] = useState(1);
+  useEffect(() => {
+    setSearch(new URLSearchParams(location.search).get("search") ?? "");
+    setPage(1);
+    setTab("orders");
+    setStage("all");
+    setChannel("all");
+    setPayment("all");
+  }, [location.search]);
   const query = new URLSearchParams({ page: String(page) });
   if (search.trim()) query.set("search", search.trim());
   if (stage !== "all") query.set("stage", stage);
@@ -201,16 +233,18 @@ export function CommerceOrders({ role }: { role: Role }): React.JSX.Element {
   };
   return <>
     <Heading title="Social commerce orders"><button className="button button-primary" onClick={() => setCapture("order")}>New order</button>{isAdmin(role) && <button className="button button-secondary" onClick={() => { setTab("links"); setCapture("link"); }}>Create app link</button>}</Heading>
-    <p>One workflow for every channel. Social-platform API capture is not connected; use manual entry, checkout links, or authenticated imports.</p>
+    <p>Create → verify payment &amp; reserve → pack → dispatch → deliver → complete. Each order shows what to do next.</p>
     <ErrorBox message={orders.error || links.error || error} />
     <div className="tabs">{["orders", ...(isAdmin(role) ? ["links", "import"] : [])].map((item) => <button key={item} className={tab === item ? "tab active" : "tab"} onClick={() => { setTab(item); setCapture(null); }}>{label(item)}</button>)}</div>
     {capture && <Panel title={capture === "link" ? "Create a shareable checkout link" : "Capture a customer order"}><button className="button button-secondary" onClick={() => setCapture(null)}>Close form</button><CaptureForm linkMode={capture === "link"} saved={(order) => { setCapture(null); orders.reload(); links.reload(); if (order) navigate(`/orders/${order.id}`); }} /></Panel>}
     {tab === "orders" && <Panel title={`Unified inbox (${orders.data?.total ?? 0})`}>
+      <div className="order-stage-filters" aria-label="Quick order stage filters">{[["all", "All orders"], ["received", "Payment & review"], ["payment_verified", "Ready to pack"], ["packing", "Ready to ship"], ["shipped", "In transit"], ["delivered", "Ready to complete"], ["completed", "Completed"]].map(([value, title]) => <button className={stage === value ? "button button-primary" : "button button-secondary"} key={value} type="button" aria-pressed={stage === value} onClick={() => { setStage(value); setPage(1); }}>{title}</button>)}</div>
       <div className="form-grid commerce-filters"><label className="field-label">Search orders<input maxLength={200} value={search} onChange={(event) => { setSearch(event.target.value); setPage(1); }} placeholder="Order, customer, external ID" /></label>
         <label className="field-label">Stage<select value={stage} onChange={(event) => { setStage(event.target.value); setPage(1); }}><option value="all">All stages</option>{stages.map((item) => <option value={item} key={item}>{label(item)}</option>)}</select></label>
         <label className="field-label">Channel<select value={channel} onChange={(event) => { setChannel(event.target.value); setPage(1); }}><option value="all">All channels</option>{channels.map((item) => <option key={item}>{item}</option>)}</select></label>
         <label className="field-label">Payment<select value={payment} onChange={(event) => { setPayment(event.target.value); setPage(1); }}><option value="all">All payments</option>{["unpaid", "submitted", "verified", "rejected", "refund_due", "refunded"].map((item) => <option key={item} value={item}>{label(item)}</option>)}</select></label></div>
-      {orders.loading ? <p>Loading orders...</p> : <div className="commerce-table-wrap"><table className="commerce-table"><thead><tr><th>Order</th><th>Customer</th><th>Channel</th><th>Stage / payment</th><th>Total</th></tr></thead><tbody>{rows.map((order) => <tr key={order.id}><td><Link className="inline-link" to={`/orders/${order.id}`}>{order.orderNumber}</Link><small>{dateLabel(order.createdAt)}</small></td><td>{order.customerName}</td><td>{order.channel}<small>{order.externalId}</small></td><td>{label(order.stage)}<small>{label(order.paymentStatus ?? "unpaid")}</small></td><td>{money(order.totalMinor, order.currency)}</td></tr>)}</tbody></table>{!rows.length && <p>No matching orders.</p>}</div>}
+      <div className="button-group"><button className="button button-secondary" type="button" disabled={orders.loading} onClick={orders.reload}>Refresh orders</button><button className="button button-secondary" type="button" onClick={() => { setSearch(""); setStage("all"); setChannel("all"); setPayment("all"); setPage(1); }}>Clear filters</button></div>
+      {orders.loading ? <p role="status">Loading orders...</p> : orders.error ? <p>Orders could not be loaded. Use Refresh orders to retry.</p> : <div className="commerce-table-wrap"><table className="commerce-table"><thead><tr><th>Order</th><th>Customer</th><th>Channel</th><th>Stage / payment</th><th>Total</th><th>Next action</th></tr></thead><tbody>{rows.map((order) => <tr key={order.id}><td><Link className="inline-link" to={`/orders/${order.id}`}>{order.orderNumber}</Link><small>{dateLabel(order.createdAt)}</small></td><td>{order.customerName}</td><td>{order.channel}<small>{order.externalId}</small></td><td><span className={`order-stage-badge order-stage-${order.stage}`}>{label(order.stage)}</span><small>{label(order.paymentStatus ?? "unpaid")}</small></td><td>{money(order.totalMinor, order.currency)}</td><td><Link className="inline-link order-next-link" to={`/orders/${order.id}`}>{orderGuidance(order, role).title} →</Link></td></tr>)}</tbody></table>{!rows.length && <div className="order-empty"><h3>No matching orders</h3><p>Clear the filters to see more orders, or create a new customer order.</p><button className="button button-primary" type="button" onClick={() => setCapture("order")}>Create your next order</button></div>}</div>}
       <div className="button-group"><button className="button button-secondary" disabled={page === 1 || orders.loading} onClick={() => setPage((page) => page - 1)}>Previous page</button><span>Page {page}</span><button className="button button-secondary" disabled={orders.loading || page * (orders.data?.pageSize ?? 50) >= (orders.data?.total ?? 0)} onClick={() => setPage((page) => page + 1)}>Next page</button></div>
     </Panel>}
     {tab === "links" && <Panel title="Checkout app links"><p>Share these links in social posts, chats, or your bio. Each link offers a reusable cart; each customer gets a private tracking link. Treat tracking links as confidential.</p>{links.data?.items.map((link) => <article className="commerce-link-card" key={link.id}><strong>{link.title}</strong><p>{link.channel} · Expires {dateLabel(link.expiresAt)} · {link.active && new Date(link.expiresAt).getTime() > Date.now() ? "Active" : "Unavailable"}</p><ShareLink path={link.checkoutPath} />{Boolean(link.active) && <button className="button button-secondary" disabled={busy} onClick={() => void disable(link.id)}>Disable link</button>}</article>)}{!links.data?.items.length && <p>No checkout links yet.</p>}</Panel>}
@@ -223,7 +257,8 @@ export function CommerceOrderDetails({ role }: { role: Role }): React.JSX.Elemen
   const order = useLoad<Order>(`/orders/${id}`);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
-  const [busy, setBusy] = useState(false);
+  const [saving, setBusy] = useState(false);
+  const busy = saving || order.loading;
   const [reviewNote, setReviewNote] = useState("");
   const [shipping, setShipping] = useState(false);
   const run = async (action: string, body: Record<string, unknown>, method = "POST") => {
@@ -233,41 +268,52 @@ export function CommerceOrderDetails({ role }: { role: Role }): React.JSX.Elemen
     finally { setBusy(false); }
   };
   const fromForm = (event: React.FormEvent<HTMLFormElement>, action: string) => { event.preventDefault(); void run(action, Object.fromEntries(new FormData(event.currentTarget))); };
-  if (order.loading) return <p>Loading order...</p>;
+  if (order.loading && !order.data) return <p role="status">Loading order...</p>;
   if (!order.data) return <ErrorBox message={order.error || "Order unavailable."} />;
   const data = order.data;
   const completed = data.stage === "completed";
   const next: Record<string, string> = { payment_verified: "packing", shipped: "delivered", delivered: "completed" };
   const canCancel = ["received", "payment_verified", "packing"].includes(data.stage);
   const pendingPayment = data.payments.find((payment) => payment.status === "submitted");
+  const guidance = orderGuidance({ ...data, paymentStatus: pendingPayment ? "submitted" : data.payments.at(-1)?.status ?? data.paymentStatus }, role);
+  const lifecycle = ["received", "payment_verified", "packing", "shipped", "delivered", "completed"];
+  const stageIndex = lifecycle.indexOf(data.stage);
   return <div className="commerce-order-details">
     <Link className="back-link" to="/orders">Back to orders</Link>
     <Heading title="Order details"><button className="button button-secondary" disabled={!completed || busy || !!order.error} title={completed ? "Preview and print the completed invoice" : "Mark the delivered order completed to enable invoice printing"} onClick={() => window.print()}>Print invoice</button></Heading>
     {!completed && <p className="commerce-no-print">Invoice printing is available after the order is marked completed.</p>}
     <ErrorBox message={order.error || error} />{notice && <div className="success-box" role="status">{notice}</div>}
+    <section className="panel order-next-action commerce-no-print" aria-label="Next required action">
+      <div><span className="page-eyebrow">{data.orderNumber} · {label(data.stage)}</span><h2>{guidance.title}</h2><p>{guidance.description}</p></div>
+      <div className="button-group">
+        {next[data.stage] && <button className="button button-primary" disabled={busy || !!order.error} onClick={() => void run("", { stage: next[data.stage] }, "PATCH")}>{busy ? "Updating..." : guidance.title}</button>}
+        {guidance.target && <a className="button button-primary" href={`#${guidance.target}`}>{data.stage === "packing" ? "Go to dispatch" : "Go to payment review"}</a>}
+        {completed && <button className="button button-primary" disabled={busy || !!order.error} onClick={() => window.print()}>Print completed invoice</button>}
+      </div>
+      {data.stage !== "cancelled" && <ol className="order-progress" aria-label="Order lifecycle">{lifecycle.map((stage, index) => <li key={stage} className={index < stageIndex ? "done" : index === stageIndex ? "current" : ""} aria-current={index === stageIndex ? "step" : undefined}><span>{index < stageIndex ? "✓" : index + 1}</span><strong>{label(stage)}</strong><small>{stage === "payment_verified" ? "Stock reserved" : stage === "shipped" ? "Stock deducted" : stage === "completed" ? "Sale recorded" : index === stageIndex ? "Current stage" : ""}</small></li>)}</ol>}
+      {data.stage === "packing" && (!data.customerPhone?.trim() || !data.shippingAddress?.trim()) && <p className="error-box" role="alert">Delivery details are missing. Add the customer phone and shipping address below before dispatch.</p>}
+    </section>
     <Panel className="commerce-invoice" title={`Invoice ${data.invoiceNumber}`}><strong>{data.businessName}</strong><p>Issued: {dateLabel(data.createdAt)}</p><p className="mono">{data.orderNumber}</p><p>{data.customerName} · {data.channel}{data.externalId ? ` · ${data.externalId}` : ""}</p><p>{data.customerEmail} {data.customerPhone}</p><p>{data.shippingAddress || "No shipping address yet"}</p>{data.customerId && canAccessPage(role, "/customers") && <Link className="inline-link commerce-no-print" to={`/customers/${data.customerId}`}>View customer profile</Link>}<Items items={data.items} currency={data.currency} /><div className="order-total"><span>Total</span><strong>{money(data.totalMinor, data.currency)}</strong></div><p>Stage: <strong>{label(data.stage)}</strong>. Payment: <strong>{data.refundDue ? "Refund due" : label(data.payments.at(-1)?.status ?? "unpaid")}</strong></p></Panel>
     <div className="detail-grid commerce-no-print"><div>
-      <Panel title="Workflow"><p>Received → payment verified + stock reserved → packing → shipped + stock deducted → delivered → completed + sale recorded.</p><div className="button-group">
-        {next[data.stage] && <button className="button button-primary" disabled={busy} onClick={() => void run("", { stage: next[data.stage] }, "PATCH")}>Mark {label(next[data.stage])}</button>}
-        {completed && <button className="button button-primary" disabled>Mark Completed</button>}
+      <div id="order-fulfillment" className="order-anchor"><Panel title="Fulfillment & delivery"><p>{data.stage === "received" ? "Resolve stock shortages before payment verification." : guidance.description}</p><div className="button-group">
         {canCancel && <button className="button button-secondary" disabled={busy} onClick={() => { if (window.confirm("Cancel this order and release its reserved stock? A verified payment will require a manual refund.")) void run("", { stage: "cancelled" }, "PATCH"); }}>Cancel order</button>}
       </div>
       {data.stage === "received" && <OrderStockCheck order={data} canReceive={canAccessPage(role, "/inventory")} />}
-      {data.stage === "packing" && <ShipmentForm busy={busy} submit={(body) => run("", body, "PATCH")} />}
       <ShipmentDetails carrier={data.carrier} trackingNumber={data.trackingNumber} />
-      {canCancel && <><button className="button button-secondary" onClick={() => setShipping(!shipping)}>Edit shipping details</button>{shipping && <form className="modal-form" onSubmit={(event) => fromForm(event, "shipping")}><label className="field-label">Customer phone<input name="customerPhone" defaultValue={data.customerPhone} required maxLength={50} /></label><label className="field-label">Shipping address<textarea name="shippingAddress" defaultValue={data.shippingAddress} required maxLength={1000} /></label><button className="button button-primary" disabled={busy}>Save shipping details</button></form>}</>}
-      </Panel>
-      <Panel title="Payment validation">{data.payments.map((payment) => <article className="commerce-link-card" key={payment.id}><strong>{payment.method} · {payment.reference}</strong><p>{money(payment.amountMinor, payment.currency)} · {label(payment.status)}</p>{payment.reviewNote && <p>{payment.reviewNote}</p>}</article>)}
+      {canCancel && <><button className="button button-secondary" disabled={busy} onClick={() => setShipping(!shipping)}>Edit shipping details</button>{(shipping || (data.stage === "packing" && (!data.customerPhone?.trim() || !data.shippingAddress?.trim()))) && <form className="modal-form" onSubmit={(event) => fromForm(event, "shipping")}><label className="field-label">Customer phone<input name="customerPhone" defaultValue={data.customerPhone} required maxLength={50} /></label><label className="field-label">Shipping address<textarea name="shippingAddress" defaultValue={data.shippingAddress} required maxLength={1000} /></label><button className="button button-primary" disabled={busy}>Save shipping details</button></form>}</>}
+      {data.stage === "packing" && <ShipmentForm busy={busy} submit={(body) => run("", body, "PATCH")} />}
+      </Panel></div>
+      <div id="order-payment" className="order-anchor"><Panel title="Payment validation">{data.payments.map((payment) => <article className="commerce-link-card" key={payment.id}><strong>{payment.method} · {payment.reference}</strong><p>{money(payment.amountMinor, payment.currency)} · {label(payment.status)}</p>{payment.reviewNote && <p>{payment.reviewNote}</p>}</article>)}
         {data.stage === "received" && !pendingPayment && <PaymentForm totalMinor={data.totalMinor} currency={data.currency} busy={busy} submit={(body) => run("payments", body)} />}
         {pendingPayment && data.stage === "received" && isAdmin(role) && <><p>Verify the funds independently before approval. Approval reserves inventory atomically.</p><label className="field-label">Review note / rejection reason<textarea maxLength={1000} value={reviewNote} onChange={(event) => setReviewNote(event.target.value)} /></label><div className="button-group"><button className="button button-primary" disabled={busy} onClick={() => void run("verify-payment", { paymentId: pendingPayment.id, note: reviewNote })}>Verify payment & reserve stock</button><button className="button button-secondary" disabled={busy || !reviewNote.trim()} onClick={() => void run("reject-payment", { paymentId: pendingPayment.id, note: reviewNote })}>Reject payment</button></div></>}
         {pendingPayment && data.stage === "received" && !isAdmin(role) && <p>An owner or admin must review this payment.</p>}
         {data.refundDue && isAdmin(role) && <form className="modal-form" onSubmit={(event) => fromForm(event, "refund")}><p>Issue the refund outside SellerOne, then record its reference. This does not transfer money.</p><label className="field-label">Refund reference / note<input name="note" required maxLength={1000} /></label><button className="button button-primary" disabled={busy}>Record manual refund</button></form>}
-      </Panel>
-      <Panel title="Customer communication">{data.trackingPath ? <><ShareLink path={data.trackingPath} /><p>Send this private link to the customer for order confirmation and live status. Do not post it publicly.</p></> : <p>This legacy order has no public tracking link.</p>}
+      </Panel></div>
+      <details className="order-secondary"><summary>Customer communication &amp; tracking</summary><Panel title="Customer communication">{data.trackingPath ? <><ShareLink path={data.trackingPath} /><p>Send this private link to the customer for order confirmation and live status. Do not post it publicly.</p></> : <p>This legacy order has no public tracking link.</p>}
         <p>No automatic email or social message is sent. Prepare a message, send it through your channel, then log it as sent. Sent messages also appear on customer tracking.</p>
         <form className="modal-form" onSubmit={(event) => fromForm(event, "communications")}><label className="field-label">Customer message<textarea name="message" required maxLength={2000} defaultValue={`Your order ${data.orderNumber} is ${label(data.stage).toLowerCase()}.`} key={data.stage} /></label><label className="field-label">Delivery status<select name="status"><option value="prepared">Prepared (not sent)</option><option value="sent">Sent manually</option></select></label><button className="button button-primary" disabled={busy}>Save communication</button></form>
         {data.communications.map((message) => <article className="commerce-link-card" key={message.id}><strong>{label(message.status ?? "")}</strong><p>{message.message}</p><small>{dateLabel(message.createdAt)} · {message.actor}</small></article>)}
-      </Panel>
+      </Panel></details>
     </div><div><Panel title="Order timeline"><Timeline events={data.timeline} /></Panel>{data.notes && <Panel title="Internal notes"><p>{data.notes}</p></Panel>}</div></div>
   </div>;
 }

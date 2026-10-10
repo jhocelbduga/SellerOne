@@ -106,6 +106,205 @@ before(async () => {
 after(async () => { await stop(); rmSync(directory, { recursive: true, force: true }); });
 
 describe("social commerce platform", () => {
+  it("retires products with confirmed reasons, immutable history and independent stakeholder notifications", async () => {
+    const accounts: { role: string; id: string; cookie: string }[] = [];
+    for (const role of ["admin", "inventory_controller", "order_processing_specialist"]) {
+      const invite = await request("/users", "POST", { name: `Lifecycle ${role}`, email: `lifecycle-${role}@example.test`, role });
+      assert.equal(invite.status, 201);
+      const token = new URL(String(invite.body.inviteUrl)).searchParams.get("token");
+      const registered = await request("/auth/register", "POST", { token, password: "Lifecycle-Test-2026!" }, "");
+      assert.equal(registered.status, 201);
+      const self = await request("/auth/status", "GET", undefined, registered.cookie);
+      accounts.push({ role, id: String((self.body.user as Row).id), cookie: registered.cookie });
+    }
+    const admin = accounts[0]; const controller = accounts[1]; const specialist = accounts[2];
+    const variantId = await product();
+    const record = ((await request("/products")).body.items as Row[]).find((p) => (p.variants as Row[]).some((v) => v.id === variantId))!;
+    const productId = String(record.id);
+    assert.equal((await request(`/products/${productId}`, "PATCH", { categories: ["Lifecycle preserved"] })).status, 200);
+    const priorOrder = await order(variantId);
+    const offer = await request("/checkout-links", "POST", { title: "Lifecycle offer", currency: "PHP", items: [{ variantId, quantity: 1, unitPriceMinor: 500 }], validDays: 7 });
+    assert.equal(offer.status, 201);
+    const checkoutToken = String(offer.body.checkoutPath).split("/").at(-1);
+    const retire = (extra: Row = {}) => ({ action: "delete", reason: "End of Life (EOL)", comments: "", confirmed: true, requestKey: crypto.randomUUID(), expectedStatus: "active", ...extra });
+    for (const cookie of [staffCookie, controller.cookie, specialist.cookie]) {
+      assert.equal((await request(`/product-lifecycle/${productId}`, "POST", retire(), cookie)).status, 403);
+    }
+    for (const extra of [{ reason: "" }, { reason: "Invalid" }, { reason: "Other", comments: " " }, { confirmed: false }, { comments: "x".repeat(2001) }, { action: "destroy" }, { action: ["delete"] }, { requestKey: "bad" }]) {
+      assert.equal((await request(`/product-lifecycle/${productId}`, "POST", retire(extra))).status, 400);
+    }
+    assert.equal((await request(`/product-lifecycle/${productId}`, "POST", retire({ expectedStatus: "archived" }))).status, 409);
+    assert.equal((await request(`/products/${productId}`, "PATCH", { active: false })).status, 400);
+    assert.equal((await request(`/products/${productId}`, "PATCH", { name: "Admin overwrite" }, admin.cookie)).status, 403);
+    const failureDb = new DatabaseSync(databasePath);
+    failureDb.exec("CREATE TRIGGER lifecycle_test_failure BEFORE INSERT ON product_lifecycle_events BEGIN SELECT RAISE(ABORT, 'Audit storage failure'); END;");
+    try {
+      assert.equal((await request(`/product-lifecycle/${productId}`, "POST", retire())).status, 500);
+      assert.equal((await request(`/products/${productId}`)).body.active, true);
+      assert.equal(((await request(`/product-lifecycle/${productId}`)).body.items as Row[]).length, 0);
+      assert.equal(((await request("/notifications")).body.items as Row[]).filter((entry) => entry.productId === productId).length, 0);
+    } finally { failureDb.exec("DROP TRIGGER lifecycle_test_failure"); failureDb.close(); }
+    const phased = retire({ reason: "Product Phase-Out" });
+    assert.equal((await request(`/product-lifecycle/${productId}`, "POST", phased, admin.cookie)).status, 200);
+    assert.equal((await request(`/products/${productId}`)).body.lifecycleStatus, "phase_out");
+    await order(variantId);
+    const ended = retire({ expectedStatus: "phase_out", comments: "No new production" });
+    const result = await request(`/product-lifecycle/${productId}`, "POST", ended, admin.cookie);
+    assert.equal(result.status, 200, JSON.stringify(result.body));
+    const events = result.body.items as Row[];
+    assert.equal(events.length, 2);
+    assert.equal(events[0].previousStatus, "phase_out");
+    assert.equal(events[0].newStatus, "eol");
+    assert.equal(events[0].actorRole, "admin");
+    assert.equal(events[0].actorName, "Lifecycle admin");
+    assert.equal(events[0].actorId, admin.id);
+    assert.equal(events[0].productId, productId);
+    assert.equal(events[0].productName, "Commerce test product");
+    assert.equal(events[0].comments, "No new production");
+    assert.ok(Date.parse(String(events[0].createdAt)));
+    assert.equal((await request(`/product-lifecycle/${productId}`, "POST", ended, admin.cookie)).status, 200);
+    assert.equal(((await request(`/product-lifecycle/${productId}`)).body.items as Row[]).length, 2);
+    assert.equal((await request(`/product-lifecycle/${productId}`, "POST", { ...ended, comments: "changed" }, admin.cookie)).status, 409);
+    assert.equal((await request(`/product-lifecycle/${productId}`, "POST", retire({ expectedStatus: "eol" }))).status, 409);
+    assert.equal((await request("/orders", "POST", { customerName: "Blocked", items: [{ variantId, quantity: 1, unitPriceMinor: 500 }] })).status, 409);
+    assert.equal((await request("/orders/import", "POST", { channel: "Instagram", externalId: "lifecycle-blocked", customerName: "Blocked", currency: "PHP", items: [{ variantId, quantity: 1, unitPriceMinor: 500 }] })).status, 409);
+    const publicOffer = await request(`/public/checkout/${checkoutToken}`, "GET", undefined, "");
+    assert.equal(publicOffer.status, 200);
+    assert.equal((publicOffer.body.items as Row[])[0].maxQuantity, 0);
+    assert.deepEqual((await request(`/products/${productId}`)).body.categories, ["Lifecycle preserved"]);
+    assert.equal((await request("/stock/in", "POST", { variantId, quantity: 1 })).status, 201);
+    const paymentId = await payment(priorOrder);
+    assert.equal((await request(`/orders/${priorOrder.id}/verify-payment`, "POST", { paymentId })).status, 200);
+    for (const stage of ["packing", "shipped", "delivered", "completed"]) {
+      const update = await request(`/orders/${priorOrder.id}`, "PATCH", { stage, ...(stage === "shipped" ? { carrier: "Test carrier" } : {}) });
+      assert.equal(update.status, 200, JSON.stringify(update.body));
+    }
+    assert.equal(Number((await balance(variantId)).quantityOnHand), 9);
+    const stockSettings = (await request("/inventory-alerts")).body;
+    assert.equal((await request("/inventory-alerts", "PUT", { ...stockSettings, recipients: { roles: [], userIds: [] } })).status, 200);
+    for (const account of [admin, controller]) {
+      const list = await request("/notifications", "GET", undefined, account.cookie);
+      const items = (list.body.items as Row[]).filter((entry) => entry.productId === productId);
+      assert.equal(items.length, 2);
+      assert.equal(list.body.unreadCount, (list.body.items as Row[]).length);
+      const viewed = await request(`/notifications/${events[0].id}/view`, "POST", {}, account.cookie);
+      assert.equal(viewed.status, 200);
+      assert.equal((viewed.body.notification as Row).status, "read");
+      assert.equal((viewed.body.items as Row[]).filter((entry) => entry.productId === productId).length, 1);
+    }
+    assert.equal(((await request("/notifications", "GET", undefined, specialist.cookie)).body.items as Row[]).length, 0);
+    assert.equal(((await request("/notifications")).body.items as Row[]).filter((entry) => entry.productId === productId).length, 2);
+    assert.equal((await request(`/notifications/${events[0].id}/view`, "POST", {}, specialist.cookie)).status, 403);
+    assert.equal((await request(`/users/${controller.id}`, "PATCH", { role: "staff" })).status, 200);
+    assert.equal((await request("/notifications", "GET", undefined, controller.cookie)).status, 401);
+    const changedLogin = await request("/auth/login", "POST", { email: "lifecycle-inventory_controller@example.test", password: "Lifecycle-Test-2026!" }, "");
+    assert.equal(changedLogin.status, 200);
+    controller.cookie = changedLogin.cookie;
+    assert.equal(((await request("/notifications", "GET", undefined, controller.cookie)).body.items as Row[]).length, 0);
+    assert.equal((await request(`/notifications/${events[1].id}/view`, "POST", {}, controller.cookie)).status, 403);
+    assert.equal((await request(`/users/${controller.id}`, "PATCH", { role: "inventory_controller" })).status, 200);
+    const restored = await request(`/product-lifecycle/${productId}`, "POST", retire({ action: "restore", reason: "Other", comments: "Supplier resumed production", expectedStatus: "eol" }));
+    assert.equal(restored.status, 200);
+    assert.equal(restored.body.status, "active");
+    for (const reason of ["Product Discontinued", "Duplicate Product Record", "Incorrect Product Setup", "Supplier No Longer Available", "Regulatory or Compliance Requirements", "Other"]) {
+      const retired = await request(`/product-lifecycle/${productId}`, "POST", retire({ reason, comments: "Business lifecycle test" }));
+      assert.equal(retired.status, 200);
+      assert.equal(retired.body.status, reason === "Product Discontinued" ? "discontinued" : "archived");
+      assert.equal((await request(`/product-lifecycle/${productId}`, "POST", retire({ action: "restore", reason: "Other", comments: "Resume", expectedStatus: retired.body.status }))).status, 200);
+    }
+    for (const action of ["archive", "deactivate"]) {
+      const retired = await request(`/product-lifecycle/${productId}`, "POST", retire({ action, reason: "Other", comments: "Explicit action" }));
+      assert.equal(retired.status, 200);
+      assert.equal(retired.body.status, action === "archive" ? "archived" : "discontinued");
+      assert.equal((await request(`/product-lifecycle/${productId}`, "POST", retire({ action: "restore", reason: "Other", comments: "Resume", expectedStatus: retired.body.status }))).status, 200);
+    }
+    const history = (await request(`/product-lifecycle/${productId}`)).body.items;
+    await stop(); await start();
+    assert.deepEqual((await request(`/product-lifecycle/${productId}`)).body.items, history);
+    assert.equal((await request(`/products/${productId}`)).body.lifecycleStatus, "active");
+    assert.equal((await request("/inventory-alerts", "PUT", stockSettings)).status, 200);
+  });
+  it("saves complete catalogue sheets atomically with private images and Owner-only modifications", async () => {
+    const picture = await sharp({ create: { width: 40, height: 30, channels: 3, background: "#326541" } }).png().toBuffer();
+    const image = `data:image/png;base64,${picture.toString("base64")}`;
+    const created = await request("/products", "POST", { name: "Sheet product", categories: ["Drinks", "Coffee"], images: [image], variants: [
+      { name: "Small", sku: "SHEET-SMALL", uom: "cup", unitCostMinor: 100, currency: "PHP" },
+      { name: "Large", sku: "SHEET-LARGE", uom: "cup", unitCostMinor: 150, currency: "PHP" },
+    ] });
+    assert.equal(created.status, 201, JSON.stringify(created.body));
+    const id = String(created.body.id);
+    const variants = created.body.variants as Row[];
+    const sheet = { name: "Updated sheet", description: "Description", categories: ["Coffee"], images: created.body.images, active: true,
+      variants: variants.map((v) => ({ ...v, attributes: { size: String(v.name) }, reorderPoint: 2, mediumStockLevel: 5, maximumStockLevel: 10, sellingPriceMinor: 500 })) };
+    const before = (await request(`/products/${id}`)).body;
+    const tooWide = await sharp({ create: { width: 4097, height: 1, channels: 3, background: "#326541" } }).png().toBuffer();
+    for (const body of [
+      { ...sheet, name: "" },
+      { ...sheet, categories: ["Same", "same"] },
+      { ...sheet, images: ["data:image/svg+xml;base64,PHN2Zy8+"] },
+      { ...sheet, images: ["data:image/png;base64,YmFk"] },
+      { ...sheet, images: Array(4).fill(image) },
+      { ...sheet, images: [`data:image/png;base64,${tooWide.toString("base64")}`] },
+      { ...sheet, expectedUpdatedAt: "stale-version" },
+      { ...sheet, variants: [sheet.variants[0]] },
+      { ...sheet, variants: [sheet.variants[0], { ...sheet.variants[1], sku: variants[0].sku }] },
+      { ...sheet, variants: [sheet.variants[0], { ...sheet.variants[1], unitCostMinor: -1 }] },
+      { ...sheet, variants: [sheet.variants[0], { ...sheet.variants[1], uom: "" }] },
+    ]) {
+      const result = await request(`/products/${id}/sheet`, "PUT", body);
+      assert.ok([400, 409].includes(result.status), JSON.stringify(result.body));
+      assert.deepEqual((await request(`/products/${id}`)).body, before);
+    }
+    assert.equal((await request(`/products/${id}/sheet`, "PUT", { ...sheet, images: [`data:image/png;base64,${Buffer.alloc(5 * 1024 * 1024 + 1).toString("base64")}`] })).status, 413);
+    assert.deepEqual((await request(`/products/${id}`)).body, before);
+    const saved = await request(`/products/${id}/sheet`, "PUT", sheet);
+    assert.equal(saved.status, 200, JSON.stringify(saved.body));
+    assert.deepEqual(saved.body.categories, ["Coffee"]);
+    assert.deepEqual((saved.body.variants as Row[]).map((v) => v.sellingPriceMinor), [500, 500]);
+    const imageUrl = String((saved.body.images as string[])[0]);
+    const imageResponse = await fetch(`${base}${imageUrl}`, { headers: { cookie: ownerCookie } });
+    assert.equal(imageResponse.status, 200);
+    assert.equal(imageResponse.headers.get("content-type"), "image/webp");
+    assert.equal(imageResponse.headers.get("cache-control"), "private, no-store");
+    assert.equal(imageResponse.headers.get("x-content-type-options"), "nosniff");
+    const metadata = await sharp(Buffer.from(await imageResponse.arrayBuffer())).metadata();
+    assert.equal(metadata.format, "webp"); assert.equal(metadata.exif, undefined);
+    assert.equal((await fetch(`${base}${imageUrl}`)).status, 401);
+    for (const role of ["admin", "inventory_controller", "order_processing_specialist", "customer_relations_representative", "staff"]) {
+      const invite = await request("/users", "POST", { name: `Sheet ${role}`, email: `${role}@sheet.example.test`, role });
+      const account = await request("/auth/register", "POST", { token: new URL(String(invite.body.inviteUrl)).searchParams.get("token"), password: "Sheet-Test-2026!" }, "");
+      const cookie = account.cookie;
+      for (const [path, method, body] of [
+        ["/products", "POST", { name: "Blocked", variants: [] }],
+        [`/products/${id}`, "PATCH", { name: "Blocked" }],
+        [`/products/${id}/sheet`, "PUT", sheet],
+        [`/products/${id}/variants`, "POST", sheet.variants[0]],
+        [`/variants/${variants[0].id}`, "PATCH", { name: "Blocked" }],
+        [`/raw-material-bom/${variants[0].id}`, "DELETE", undefined],
+      ] as const) assert.equal((await request(path, method, body, cookie)).status, 403, `${role}: ${path}`);
+      if (role !== "customer_relations_representative") {
+        assert.equal((await request(`/products/${id}`, "GET", undefined, cookie)).status, 200);
+        assert.equal((await fetch(`${base}${imageUrl}`, { headers: { cookie } })).status, 200);
+      }
+      if (role === "inventory_controller") {
+        assert.equal((await request("/stock/in", "POST", { variantId: variants[0].id, quantity: 3 }, cookie)).status, 201);
+        assert.equal((await request("/adjustments", "POST", { variantId: variants[0].id, countedQuantity: 2 }, cookie)).status, 200);
+      }
+    }
+    const unchanged = (await request(`/products/${id}`)).body;
+    const locked = await request(`/products/${id}/sheet`, "PUT", { ...sheet, name: "Must roll back", variants: [{ ...sheet.variants[0], uom: "kg" }, sheet.variants[1]] });
+    assert.equal(locked.status, 409);
+    assert.deepEqual((await request(`/products/${id}`)).body, unchanged);
+    const other = await product(0);
+    const otherProduct = (await request("/products")).body.items as Row[];
+    const otherId = String(otherProduct.find((p) => (p.variants as Row[]).some((v) => v.id === other))?.id);
+    assert.equal((await request(`/products/${otherId}`, "PATCH", { images: [imageUrl] })).status, 400);
+    await stop(); await start();
+    assert.deepEqual((await request(`/products/${id}`)).body, unchanged);
+    assert.equal((await fetch(`${base}${imageUrl}`, { headers: { cookie: ownerCookie } })).status, 200);
+    assert.equal((await request(`/products/${id}`, "PATCH", { images: [], categories: [] })).status, 200);
+    assert.equal((await fetch(`${base}${imageUrl}`, { headers: { cookie: ownerCookie } })).status, 404);
+  });
   it("migrates legacy role constraints without losing identities, invitations or foreign-key data", () => {
     const legacy = new DatabaseSync(join(directory, "legacy-roles.sqlite"));
     try {
@@ -200,7 +399,8 @@ describe("social commerce platform", () => {
     }
     assert.equal((await request("/orders", "GET", undefined, controller.cookie)).status, 403);
     assert.equal((await request("/customers", "GET", undefined, controller.cookie)).status, 403);
-    const newProduct = await request("/products", "POST", { name: "Controller product", variants: [{ name: "Stock", uom: "pcs", unitCostMinor: 100, currency: "PHP" }] }, controller.cookie);
+    assert.equal((await request("/products", "POST", { name: "Controller product", variants: [{ name: "Stock", uom: "pcs", unitCostMinor: 100, currency: "PHP" }] }, controller.cookie)).status, 403);
+    const newProduct = await request("/products", "POST", { name: "Controller product", variants: [{ name: "Stock", uom: "pcs", unitCostMinor: 100, currency: "PHP" }] });
     assert.equal(newProduct.status, 201);
     const variantId = String((newProduct.body.variants as Row[])[0].id);
     assert.equal((await request("/stock/in", "POST", { variantId, quantity: 10 }, controller.cookie)).status, 201);

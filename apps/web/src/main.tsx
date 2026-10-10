@@ -19,6 +19,9 @@ import { ProfileSocialLinks, profilePlatforms, type ProfileLinks } from "./profi
 import { ProfilePicture, UserAvatar, initials } from "./profile-picture";
 import { canAccessPage, homePath, isAdmin, roleLabel, workspaceRoles, type Role } from "./roles";
 import { InventoryAlerts } from "./inventory-alerts";
+import { HeaderSearch } from "./header-search";
+import { ProductSheet } from "./product-sheet";
+import { ProductLifecycleControls, lifecycleLabel } from "./product-lifecycle";
 
 interface User {
   id: string;
@@ -40,6 +43,9 @@ interface Product {
   description?: string | null;
   active: boolean | number;
   variants: Variant[];
+  categories?: string[];
+  images?: string[];
+  lifecycleStatus?: string;
 }
 interface Variant {
   id: string;
@@ -157,8 +163,9 @@ function SessionProvider(): React.JSX.Element {
           <Route index element={<DashboardPage />} />
           <Route path="dashboard" element={<DashboardPage />} />
           <Route path="products" element={<ProductsPage />} />
-          <Route path="products/new" element={<ProductFormPage />} />
-          <Route path="products/:id/edit" element={<ProductFormPage />} />
+          <Route path="products/new" element={<ProductSheet role={user?.role ?? "staff"} userId={user?.id ?? ""} />} />
+          <Route path="products/:id" element={<ProductSheet role={user?.role ?? "staff"} userId={user?.id ?? ""} />} />
+          <Route path="products/:id/edit" element={<ProductSheet role={user?.role ?? "staff"} userId={user?.id ?? ""} />} />
           <Route path="inventory" element={<InventoryPage />} />
           <Route path="raw-material-bom" element={<RawMaterialBomPage enabled={rawMaterialBomEnabled} role={user?.role ?? "staff"} />} />
           <Route path="orders" element={<CommerceOrders role={user?.role ?? "staff"} />} />
@@ -255,6 +262,7 @@ function AccountOptions({ user, onNavigate, avatar = false }: { user: User; onNa
 }
 
 function StockNotifications({ canManageInventory }: { canManageInventory: boolean }): React.JSX.Element {
+  const { user } = useContext(SessionContext);
   const location = useLocation();
   const [open, setOpen] = useState(false);
   const container = useRef<HTMLDivElement>(null);
@@ -262,10 +270,14 @@ function StockNotifications({ canManageInventory }: { canManageInventory: boolea
   const closeButton = useRef<HTMLButtonElement>(null);
   type Notification = {
     id: string; status: "read" | "unread"; readAt: string | null; createdAt: string;
+    productName: string;
+  } & ({
     variantId: string; locationId: string; productName: string; variantName: string;
     sku: string; locationName: string; quantityOnHand: number; reorderPoint: number; uom: string;
     kind: "low_stock" | "out_of_stock" | "replenishment"; threshold: number; quantityAvailable: number; quantityReserved: number;
-  };
+  } | {
+    kind: "product_lifecycle"; productId: string; reason: string; comments: string; actorName: string; actorRole: Role; previousStatus: string; newStatus: string;
+  });
   const { data, loading, error, reload, setData } = useLoad<{ items: Notification[]; unreadCount: number }>("/notifications");
   const [selected, setSelected] = useState<Notification | null>(null);
   const [viewing, setViewing] = useState(false);
@@ -328,31 +340,85 @@ function StockNotifications({ canManageInventory }: { canManageInventory: boolea
     {open && <section id="stock-notifications-panel" className="notification-panel" aria-labelledby="stock-notifications-title" aria-busy={loading}>
       <div className="notification-heading"><h2 id="stock-notifications-title">Notification management</h2><button ref={closeButton} className="icon-button" type="button" aria-label="Close notifications" onClick={() => { setOpen(false); trigger.current?.focus(); }}><X size={18} /></button></div>
       <p role="status">{count} unread notifications</p>
-      <p>Select a stock notification to view its details and mark it read for your account.</p>
+      <p>Select a notification to view its details and mark it read for your account.</p>
       {viewError && <div className="error-box" role="alert">{viewError}</div>}
       {selected && <section className="notification-detail" aria-labelledby="notification-detail-title">
-        <h3 ref={detail} tabIndex={-1} id="notification-detail-title">{selected.productName} · {selected.variantName}</h3>
-        <p>{selected.sku} · {selected.locationName}</p>
+        <h3 ref={detail} tabIndex={-1} id="notification-detail-title">{selected.productName}{selected.kind !== "product_lifecycle" && ` · ${selected.variantName}`}</h3>
+        {selected.kind === "product_lifecycle" ? <>
+          <p>Product lifecycle: {lifecycleLabel(selected.previousStatus ?? "")} → {lifecycleLabel(selected.newStatus ?? "")}</p>
+          <p>Reason: {selected.reason}</p>{selected.comments && <p>Comments: {selected.comments}</p>}
+          <p>By {selected.actorName} ({roleLabel(selected.actorRole)}) · Product ID: {selected.productId}</p>
+          {user && canAccessPage(user.role, "/products") && <Link className="inline-link" to={`/products/${selected.productId}`} onClick={() => setOpen(false)}>View product and lifecycle history</Link>}
+        </> : <><p>{selected.sku} · {selected.locationName}</p>
         <p>{selected.kind === "out_of_stock" ? "Out of stock" : selected.kind === "replenishment" ? "Replenishment needed" : "Low stock"}: {selected.quantityAvailable} {selected.uom} available · Threshold: {selected.threshold} {selected.uom}</p>
-        <p>On hand: {selected.quantityOnHand} {selected.uom} · Reserved: {selected.quantityReserved} {selected.uom}</p>
+        <p>On hand: {selected.quantityOnHand} {selected.uom} · Reserved: {selected.quantityReserved} {selected.uom}</p></>}
         <p>Created: {new Date(selected.createdAt).toLocaleString()}</p>
         <p>Status: Read{selected.readAt ? ` · ${new Date(selected.readAt).toLocaleString()}` : ""}</p>
-        <p>Reading acknowledges this notification; it does not resolve the stock shortage.</p>
+        <p>Reading acknowledges this notification; it does not change product status or resolve a stock shortage.</p>
         <button className="button button-secondary" type="button" onClick={() => { setSelected(null); closeButton.current?.focus(); }}>Back to notification list</button>
       </section>}
       {loading ? <p role="status">Checking stock alerts...</p> : error ? <div className="error-box" role="alert">{error}</div>
         : data?.items.length ? <><ul className="notification-list" aria-label="Selectable notifications">
           {data.items.filter((item) => item.status === "unread").map((item) => <li key={item.id}>
             <button type="button" className={`notification-item ${item.status}`} disabled={viewing} aria-pressed={selected?.id === item.id} onClick={() => void view(item.id)}>
-              <strong>{item.productName} · {item.variantName}</strong>
-              <small>{item.sku} · {item.locationName}</small>
-              <span>{item.kind === "out_of_stock" ? "Out of stock" : item.kind === "replenishment" ? "Replenishment needed" : "Low stock"} · {item.quantityAvailable} {item.uom} available · View details</span>
+              <strong>{item.productName}{item.kind !== "product_lifecycle" && ` · ${item.variantName}`}</strong>
+              {item.kind === "product_lifecycle" ? <><small>Product lifecycle · {lifecycleLabel(item.newStatus ?? "")}</small><span>{item.reason} · View details</span></> : <><small>{item.sku} · {item.locationName}</small>
+              <span>{item.kind === "out_of_stock" ? "Out of stock" : item.kind === "replenishment" ? "Replenishment needed" : "Low stock"} · {item.quantityAvailable} {item.uom} available · View details</span></>}
             </button>
           </li>)}
         </ul></> : <p role="status">No pending unread alerts. Viewed alerts have been cleared from this list; stock shortages may still require attention.</p>}
       {viewing && <p role="status">Opening notification...</p>}
       <div className="notification-actions"><button className="button button-secondary" type="button" disabled={loading || viewing} onClick={() => { setSelected(null); setViewError(""); reload(); }}>Refresh alerts</button>{canManageInventory && <Link className="button" to="/inventory" onClick={() => setOpen(false)}>View inventory</Link>}</div>
-      <small>Only alerts assigned to you are listed. Read status is saved per user. Alerts recur after recovery; shortages escalate to out-of-stock at zero.</small>
+      <small>Only alerts assigned to you are listed. Read status is saved per user. Stock alerts recur after recovery; shortages escalate to out-of-stock at zero. Lifecycle changes remain available in product history.</small>
+    </section>}
+  </div>;
+}
+
+function WorkspaceMenu({ role, onNavigate }: { role: Role; onNavigate: () => void }): React.JSX.Element {
+  const [open, setOpen] = useState(false);
+  const container = useRef<HTMLDivElement>(null);
+  const trigger = useRef<HTMLButtonElement>(null);
+  const panelId = React.useId();
+  const location = useLocation();
+  const details = useLoad<{ businessName: string; currency: string; timezone: string }>(open && isAdmin(role) ? "/settings" : "");
+  useEffect(() => { setOpen(false); }, [location.key, role]);
+  useEffect(() => {
+    if (!open) return;
+    const dismiss = (event: PointerEvent | FocusEvent) => {
+      if (event.target instanceof Node && !container.current?.contains(event.target)) setOpen(false);
+    };
+    const escape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") { setOpen(false); trigger.current?.focus(); }
+    };
+    document.addEventListener("pointerdown", dismiss);
+    document.addEventListener("focusin", dismiss);
+    document.addEventListener("keydown", escape);
+    return () => {
+      document.removeEventListener("pointerdown", dismiss);
+      document.removeEventListener("focusin", dismiss);
+      document.removeEventListener("keydown", escape);
+    };
+  }, [open]);
+  const navigate = () => { setOpen(false); onNavigate(); };
+  return <div className="workspace-menu" ref={container}>
+    <button className="workspace-switcher" type="button" ref={trigger} aria-label="My workspace menu" aria-expanded={open} aria-controls={panelId} onClick={() => setOpen((current) => !current)}>
+      <span className="workspace-icon"><BriefcaseBusiness size={15} /></span>
+      <span className="workspace-text"><strong>My workspace</strong><small>Business account</small></span>
+      <ChevronDown size={15} className={`muted workspace-chevron${open ? " workspace-chevron-open" : ""}`} />
+    </button>
+    {open && <section className="workspace-panel" id={panelId} aria-label="Workspace menu">
+      <strong>Current workspace</strong><small>Your role: {roleLabel(role)}</small>
+      {isAdmin(role) && <>
+        {details.loading && <p role="status">Loading business details...</p>}
+        {details.error && <div className="error-box" role="alert">{details.error}<button className="text-button" type="button" onClick={details.reload}>Retry business details</button></div>}
+        {!details.loading && !details.error && details.data && <div className="workspace-details"><strong>{details.data.businessName}</strong><small>{details.data.currency} · {details.data.timezone}</small></div>}
+        <Link className="account-action" to="/settings" onClick={navigate}><BriefcaseBusiness size={16} /> Business details</Link>
+        <Link className="account-action" to="/settings#preferences" onClick={navigate}><Settings size={16} /> Settings</Link>
+        <Link className="account-action" to="/users" onClick={navigate}><Users size={16} /> Team &amp; access</Link>
+      </>}
+      {!isAdmin(role) && <small>Business details, workspace settings and team access are managed by your Owner or Administrator.</small>}
+      <Link className="account-action" to={homePath(role)} onClick={navigate}><LayoutDashboard size={16} /> Open my workspace</Link>
+      <small>This account has one workspace. Workspace switching is not available.</small>
     </section>}
   </div>;
 }
@@ -374,11 +440,7 @@ function ProtectedLayout(): React.JSX.Element {
           <span className="brand-name">seller<span>one</span></span>
           <span className="brand-period">.</span>
         </Link>
-        <div className="workspace-switcher">
-          <span className="workspace-icon"><BriefcaseBusiness size={15} /></span>
-          <span className="workspace-text"><strong>My workspace</strong><small>Business account</small></span>
-          <ChevronDown size={15} className="muted" />
-        </div>
+        <WorkspaceMenu role={user.role} onNavigate={() => setMobileNavOpen(false)} />
         <nav className="side-nav" aria-label="Main navigation">
           {primaryNav.filter((section) => section.items.some((item) => canAccessPage(user.role, item.to))).map((section) => (
             <div className="nav-section" key={section.label}>
@@ -414,7 +476,7 @@ function ProtectedLayout(): React.JSX.Element {
           <div className="breadcrumbs"><span>Workspace</span><ChevronRight size={14} /><strong>{!canAccessPage(user.role, location.pathname) ? "Access restricted" : current?.label ?? (location.pathname.startsWith("/orders/") ? "Order details" : location.pathname.startsWith("/customers/") ? "Customer profile" : "Edit product")}</strong></div>
           <div className="topbar-actions">
             <span className="today-label">{new Intl.DateTimeFormat("en-PH", { weekday: "short", month: "short", day: "numeric" }).format(new Date())}</span>
-            <button className="icon-button search-trigger" type="button"><Search size={18} /><span>Search</span><kbd>⌘ K</kbd></button>
+            <HeaderSearch role={user.role} pages={[...primaryNav.flatMap((section) => section.items), { to: "/profile", label: "Profile Settings" }, { to: "/settings", label: "Settings" }, { to: "/users", label: "User management" }, ...(rawMaterialBomEnabled ? [{ to: "/raw-material-bom", label: "Raw Material BOM" }] : [])]} />
             <StockNotifications canManageInventory={canAccessPage(user.role, "/inventory")} />
             <AccountOptions user={user} avatar onNavigate={() => setMobileNavOpen(false)} />
           </div>
@@ -577,6 +639,7 @@ function StatCard({ label, value, change, icon, tone = "sage" }: { label: string
 }
 
 function DashboardPage(): React.JSX.Element {
+  const { user } = useContext(SessionContext);
   const { data, loading, error } = useLoad<{
     stats: Record<string, number>;
     recentOrders: Record<string, unknown>[];
@@ -607,7 +670,7 @@ function DashboardPage(): React.JSX.Element {
         {loading ? <div className="list-skeleton" /> : data?.lowStock.length ? <div className="low-stock-list">{data.lowStock.map((item) => <div className="low-stock-row" key={String(item.variantId)}><span className="mini-product"><Package size={16} /></span><span className="low-stock-meta"><strong>{String(item.productName)} · {String(item.variantName)}</strong><small>SKU {String(item.sku)} <span>·</span> reorder at {String(item.reorderPoint)} {String(item.uom)}</small></span><span className="stock-count">{String(item.quantityOnHand)}<small>{String(item.uom)} left</small></span></div>)}<Link className="inline-link low-stock-link" to="/inventory">See all inventory <ChevronRight size={14} /></Link></div> : <EmptyState icon={<Boxes size={19} />} title="Stock looks healthy" description="We’ll give you a heads-up when something needs a restock." />}
       </section>
     </div>
-    <section className="welcome-banner"><div className="welcome-art"><div className="welcome-sun" /><div className="welcome-hill hill-back" /><div className="welcome-hill hill-front" /><span className="welcome-spark spark-a">✳</span><span className="welcome-spark spark-b">✳</span><span className="welcome-plant plant-a" /><span className="welcome-plant plant-b" /></div><div className="welcome-copy"><span className="soft-tag"><Sparkles size={13} /> YOUR WORKSPACE, YOUR WAY</span><h2>Small steps add up to<br />something great.</h2><p>Add a product, welcome a customer, or simply take a breath. We’ll keep everything in sync.</p><Link to="/products/new" className="inline-link">Add your first product <ChevronRight size={14} /></Link></div></section>
+    <section className="welcome-banner"><div className="welcome-art"><div className="welcome-sun" /><div className="welcome-hill hill-back" /><div className="welcome-hill hill-front" /><span className="welcome-spark spark-a">✳</span><span className="welcome-spark spark-b">✳</span><span className="welcome-plant plant-a" /><span className="welcome-plant plant-b" /></div><div className="welcome-copy"><span className="soft-tag"><Sparkles size={13} /> YOUR WORKSPACE, YOUR WAY</span><h2>Small steps add up to<br />something great.</h2><p>Add a product, welcome a customer, or simply take a breath. We’ll keep everything in sync.</p>{user?.role === "owner" ? <Link to="/products/new" className="inline-link">Add your first product <ChevronRight size={14} /></Link> : <Link to="/products" className="inline-link">View product catalogue <ChevronRight size={14} /></Link>}</div></section>
   </>;
 }
 
@@ -616,166 +679,51 @@ function LoadingGrid(): React.JSX.Element {
 }
 
 function ProductsPage(): React.JSX.Element {
+  const { user } = useContext(SessionContext);
+  const owner = user?.role === "owner";
+  const [catalogueView, setCatalogueView] = useState<"cards" | "table">("cards");
+  const location = useLocation();
   const { data, loading, error, reload } = useLoad<{ items: Product[] }>("/products");
-  const [search, setSearch] = useState("");
-  const filtered = (data?.items ?? []).filter((product) => `${product.name} ${product.variants.map((variant) => variant.sku).join(" ")}`.toLowerCase().includes(search.toLowerCase()));
+  const [search, setSearch] = useState(() => new URLSearchParams(location.search).get("search") ?? "");
+  useEffect(() => { setSearch(new URLSearchParams(location.search).get("search") ?? ""); }, [location.search]);
+  const filtered = (data?.items ?? []).filter((product) => `${product.name} ${product.variants.map((variant) => `${variant.name} ${variant.sku}`).join(" ")}`.toLowerCase().includes(search.toLowerCase()));
   const rows = filtered.map((product) => {
     const variants = product.variants;
     return {
       id: product.id, name: product.name, description: product.description ?? "",
       sku: variants.map((variant) => variant.sku).join(", "),
       price: variants[0]?.unitCostMinor ?? 0, currency: variants[0]?.currency ?? "PHP",
-      stock: "", variants: variants.length, active: Boolean(product.active),
+      stock: "", variants: variants.length, lifecycleStatus: product.lifecycleStatus ?? (product.active ? "active" : "archived"),
     };
   });
   const stock = useLoad<{ items: Record<string, unknown>[] }>("/stock");
   for (const row of rows) row.stock = stockQuantitySummary((stock.data?.items ?? []).filter((item) => item.productId === row.id));
   return <>
-    <PageHeading eyebrow="YOUR CATALOG" title="Products" description="The things you make, source, and sell." action={<Link className="button button-primary" to="/products/new"><Plus size={17} /> Add product</Link>} />
+    <PageHeading eyebrow="YOUR CATALOG" title="Products" description="The things you make, source, and sell." action={owner ? <Link className="button button-primary" to="/products/new"><Plus size={17} /> Add product</Link> : undefined} />
+    {!owner && <p>Only Workspace Owners can edit catalogue information.{user && isAdmin(user.role) ? " Admins can manage lifecycle status with a recorded business reason." : " You can view products and their lifecycle history."}</p>}
     {error && <PageError message={error} />}
-    <section className="panel list-panel"><div className="list-toolbar"><SearchField value={search} onChange={setSearch} placeholder="Search by name or SKU…" /><span className="result-count">{rows.length} {rows.length === 1 ? "product" : "products"}</span><IconButton label="Refresh products" onClick={reload}><Activity size={17} /></IconButton><IconButton label="Filter products"><SlidersHorizontal size={17} /></IconButton></div>
-      {loading || stock.loading ? <div className="table-skeleton" /> : <DataTable rowKey="id" rows={rows} empty="Give your catalog a home. Add a product to get started." columns={[
-        { label: "PRODUCT", render: (row) => <Link className="product-cell" to={`/products/${row.id}/edit`}><span className="product-thumb"><Package size={17} /></span><span><strong className="table-primary">{String(row.name)}</strong><small>{String(row.description) || "No description"}</small></span></Link> },
+    <section className="panel list-panel catalogue-list"><div className="list-toolbar"><SearchField value={search} onChange={setSearch} placeholder="Search by name or SKU…" /><span className="result-count">{rows.length} {rows.length === 1 ? "product" : "products"}</span><IconButton label="Refresh products" onClick={reload}><Activity size={17} /></IconButton><button className="button button-secondary" type="button" onClick={() => setCatalogueView((value) => value === "cards" ? "table" : "cards")}>{catalogueView === "cards" ? "Table view" : "Card view"}</button></div>
+    {(loading && !data) || (stock.loading && !stock.data) ? <div className="table-skeleton" /> : catalogueView === "cards" ? <div className="catalogue-cards">{filtered.map((product) => <article className="panel catalogue-card" key={product.id}>
+      <ProductLifecycleControls cardActions productId={product.id} productName={product.name} status={product.lifecycleStatus ?? (product.active ? "active" : "archived")} role={user?.role ?? "staff"} onChanged={() => { reload(); stock.reload(); }} />
+      {product.images?.[0] ? <img src={product.images[0]} alt={product.name} /> : <span className="product-thumb"><Package size={32} /></span>}
+      <h2>{product.name}</h2><p>{product.description || "No description"}</p><small>{product.categories?.join(" · ") || "Uncategorised"}</small><p>{product.variants.map((variant) => variant.sku).join(", ")}</p>
+      <p>{stockQuantitySummary((stock.data?.items ?? []).filter((row) => row.productId === product.id))} on hand · {product.active ? "Available for new orders" : "New orders blocked"}</p>
+    </article>)}{!filtered.length && <p>No matching products. Adjust your search or ask a Workspace Owner to add a product.</p>}</div> : <DataTable rowKey="id" rows={rows} empty="Give your catalog a home. Add a product to get started." columns={[
+        { label: "PRODUCT", render: (row) => <Link className="product-cell" to={`/products/${row.id}`}><span className="product-thumb"><Package size={17} /></span><span><strong className="table-primary">{String(row.name)}</strong><small>{String(row.description) || "No description"}</small></span></Link> },
         { label: "SKU", render: (row) => <span className="mono">{String(row.sku)}</span> },
         { label: "UNIT COST", className: "align-right", render: (row) => money(row.price, String(row.currency)) },
         { label: "IN STOCK", render: (row) => <span className="table-number">{String(row.stock)}</span> },
         { label: "VARIANTS", render: (row) => String(row.variants) },
-        { label: "STATUS", render: (row) => <StatusPill status={row.active ? "Active" : "Archived"} /> },
-        { label: "", render: (row) => <Link className="row-action" to={`/products/${row.id}/edit`}>Edit <ChevronRight size={14} /></Link> },
+        { label: "STATUS", render: (row) => <StatusPill status={lifecycleLabel(String(row.lifecycleStatus))} /> },
+        { label: "", render: (row) => <Link className="row-action" to={`/products/${row.id}${owner ? "/edit" : ""}`}>{owner ? "Edit Product" : "View Product"} <ChevronRight size={14} /></Link> },
       ]} />}
       <div className="table-foot"><span>Showing {rows.length} of {rows.length} products</span><span className="pagination"><button disabled aria-label="Previous page"><ChevronLeft size={16} /></button><span>1</span><button disabled aria-label="Next page"><ChevronRight size={16} /></button></span></div>
     </section>
   </>;
 }
 
-function ProductFormPage(): React.JSX.Element {
-  const { id } = useParams();
-  const editing = Boolean(id);
-  const existing = useLoad<Product>(editing ? `/products/${id}` : "");
-  const navigate = useNavigate();
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState("");
-  const [notice, setNotice] = useState("");
-  const product = editing ? existing.data : null;
-  const [form, setForm] = useState({ name: "", description: "", variantName: "Standard", variantDescription: "", uom: "pcs", sku: "", barcode: "", unitCost: "", currency: "PHP", reorderPoint: "0", attributes: "" });
-  const [initialized, setInitialized] = useState(false);
-  const [sellingPrices, setSellingPrices] = useState<Record<string, string>>({ new: "" });
-  const [stockLevels, setStockLevels] = useState<Record<string, { minimum: string; medium: string; maximum: string }>>({ new: { minimum: "0", medium: "", maximum: "" } });
-  useEffect(() => {
-    if (product && !initialized) {
-      const variant = product.variants[0];
-      setForm({
-        name: product.name,
-        description: product.description ?? "",
-        variantName: variant?.name ?? "",
-        variantDescription: variant?.description ?? "",
-        uom: variant?.uom ?? "pcs",
-        sku: variant?.sku ?? "",
-        barcode: variant?.barcode ?? "",
-        unitCost: variant ? (variant.unitCostMinor / 100).toFixed(2) : "",
-        currency: variant?.currency ?? "PHP",
-        reorderPoint: String(variant?.reorderPoint ?? 0),
-        attributes: Object.entries(variant?.attributes ?? {}).map(([key, value]) => `${key}=${value}`).join("\n"),
-      });
-      setInitialized(true);
-      setSellingPrices(Object.fromEntries(product.variants.map((variant) => [variant.id, variant.sellingPriceMinor == null ? "" : (variant.sellingPriceMinor / 100).toFixed(2)])));
-      setStockLevels(Object.fromEntries(product.variants.map((variant) => [variant.id, { minimum: String(variant.reorderPoint), medium: variant.mediumStockLevel == null ? "" : String(variant.mediumStockLevel), maximum: variant.maximumStockLevel == null ? "" : String(variant.maximumStockLevel) }])));
-    }
-  }, [product, initialized]);
-  const input = (key: keyof typeof form) => (event: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>) => setForm((value) => ({ ...value, [key]: event.target.value }));
-  const submit = async (event: React.FormEvent) => {
-    event.preventDefault(); setError(""); setNotice(""); setSaving(true);
-    try {
-      const prices = Object.fromEntries(Object.entries(sellingPrices).map(([key, value]) => {
-        const minor = value.trim() === "" ? null : Math.round(Number(value) * 100);
-        if (minor !== null && (!Number.isSafeInteger(minor) || minor < 0)) throw new Error("Enter valid non-negative selling prices.");
-        return [key, minor];
-      }));
-      const levels = Object.fromEntries(Object.entries(stockLevels).map(([key, value]) => {
-        const minimum = key === (product?.variants[0]?.id ?? "new") ? Number(form.reorderPoint) : Number(value.minimum);
-        const medium = value.medium.trim() === "" ? null : Number(value.medium);
-        const maximum = value.maximum.trim() === "" ? null : Number(value.maximum);
-        if ([minimum, medium, maximum].some((level) => level !== null && (!Number.isSafeInteger(level) || level < 0))
-          || (medium !== null && medium < minimum) || (maximum !== null && maximum < (medium ?? minimum))) {
-          throw new Error("Enter whole-number stock levels with minimum <= medium <= maximum.");
-        }
-        return [key, { reorderPoint: minimum, mediumStockLevel: medium, maximumStockLevel: maximum }];
-      }));
-      const attributes = Object.fromEntries(form.attributes.split("\n").filter(Boolean).map((line) => {
-        const separator = line.indexOf("=");
-        return separator < 1 ? ["", ""] : [line.slice(0, separator).trim(), line.slice(separator + 1).trim()];
-      }).filter(([key]) => Boolean(key)));
-      if (editing && product) {
-        await api(`/products/${id}`, { method: "PATCH", body: JSON.stringify({ name: form.name, description: form.description || null }) });
-        const variant = product.variants[0];
-        if (variant) await api(`/variants/${variant.id}`, { method: "PATCH", body: JSON.stringify({
-          name: form.variantName, description: form.variantDescription || null, uom: form.uom, sku: form.sku, barcode: form.barcode || null, attributes,
-          unitCostMinor: Math.round(Number(form.unitCost) * 100), currency: form.currency,
-          sellingPriceMinor: prices[variant.id],
-          ...levels[variant.id],
-        }) });
-        for (const additional of product.variants.slice(1)) {
-          const targets = levels[additional.id];
-          if (prices[additional.id] !== additional.sellingPriceMinor || targets.reorderPoint !== additional.reorderPoint || targets.mediumStockLevel !== additional.mediumStockLevel || targets.maximumStockLevel !== additional.maximumStockLevel) {
-            await api(`/variants/${additional.id}`, { method: "PATCH", body: JSON.stringify({ sellingPriceMinor: prices[additional.id], ...targets }) });
-          }
-        }
-        setNotice("Your product has been updated.");
-        window.setTimeout(() => navigate("/products"), 650);
-      } else {
-        await api("/products", { method: "POST", body: JSON.stringify({
-          name: form.name, description: form.description || undefined,
-          variants: [{
-            name: form.variantName, uom: form.uom, sku: form.sku, barcode: form.barcode || undefined,
-            description: form.variantDescription || undefined,
-            attributes, unitCostMinor: Math.round(Number(form.unitCost) * 100),
-            sellingPriceMinor: prices.new,
-            currency: form.currency, ...levels.new,
-          }],
-        }) });
-        navigate("/products");
-      }
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Could not save product.");
-    } finally { setSaving(false); }
-  };
-  if (editing && existing.loading) return <LoadingGrid />;
-  if (editing && existing.error) return <PageError message={existing.error} />;
-  return <>
-    <Link className="back-link" to="/products"><ChevronLeft size={15} /> Back to products</Link>
-    <PageHeading eyebrow={editing ? "CATALOG / EDIT" : "CATALOG / NEW"} title={editing ? "Edit product" : "Add a product"} description={editing ? "Update your product details and variant." : "Give your product a name and the details you’ll need later."} />
-    <form className="form-layout" onSubmit={(event) => void submit(event)}>
-      <section className="panel form-panel"><SectionHeading title="The basics" subtitle="A clear name makes everything easier." /><div className="form-grid"><label className="field-label field-span">Product name<input required maxLength={200} placeholder="e.g. House blend coffee" value={form.name} onChange={input("name")} /></label><label className="field-label field-span">Description <span className="field-optional">OPTIONAL</span><textarea rows={3} maxLength={2000} placeholder="What makes this one special?" value={form.description} onChange={input("description")} /></label></div></section>
-      <section className="panel form-panel"><SectionHeading title="First variant" subtitle="Add sizes, colours, or other options later." /><div className="form-grid">
-        <label className="field-label">Variant name<input required maxLength={200} placeholder="Standard" value={form.variantName} onChange={input("variantName")} /></label>
-        <label className="field-label">Variant description <span className="field-optional">OPTIONAL</span><textarea rows={2} maxLength={2000} placeholder="Identify this variant for receiving and stock reports" value={form.variantDescription} onChange={input("variantDescription")} /></label>
-        <label className="field-label">SKU<input required maxLength={100} placeholder="e.g. COFFEE-250" value={form.sku} onChange={input("sku")} /></label>
-        <label className="field-label">Barcode <span className="field-optional">OPTIONAL</span><input maxLength={100} placeholder="Scan or type a barcode" value={form.barcode} onChange={input("barcode")} /></label>
-        <label className="field-label">Unit cost<input required type="number" min="0" step="0.01" placeholder="0.00" value={form.unitCost} onChange={input("unitCost")} /></label>
-        <label className="field-label">Currency<select value={form.currency} onChange={input("currency")}><option value="PHP">PHP — Philippine peso</option><option value="USD">USD — US dollar</option><option value="SGD">SGD — Singapore dollar</option><option value="AUD">AUD — Australian dollar</option><option value="EUR">EUR — Euro</option><option value="GBP">GBP — British pound</option></select></label>
-        <label className="field-label field-span">Variant attributes <span className="field-optional">ONE PER LINE · KEY=VALUE</span><textarea rows={3} placeholder={"size=250 g\ncolour=Dark roast"} value={form.attributes} onChange={input("attributes")} /></label>
-      </div></section>
-      <section className="panel form-panel"><UomField value={form.uom} onChange={(uom) => setForm((current) => ({ ...current, uom }))} locked={product?.variants[0]?.uomLocked} /></section>
-      <section className="panel form-panel"><SectionHeading title="Selling prices per UOM" subtitle="Saved defaults for orders and checkout offers. Leave blank for manual pricing; zero is an explicit free price." /><div className="form-grid">
-        {(product ? product.variants : [{ id: "new", name: form.variantName, uom: form.uom, currency: form.currency }]).map((variant, index) => <label key={variant.id} className="field-label">{variant.name} selling price ({index === 0 ? form.currency : variant.currency} / {index === 0 ? form.uom : variant.uom})<input type="number" min="0" step="0.01" value={sellingPrices[variant.id] ?? ""} onChange={(event) => setSellingPrices((current) => ({ ...current, [variant.id]: event.target.value }))} /></label>)}
-      </div></section>
-      <section className="panel form-panel"><SectionHeading title="Stock levels per UOM" subtitle="Minimum is the reorder point. Medium and maximum are planning targets, not automatic receipts or hard stock limits. Leave optional targets blank if unset." /><div className="form-grid">
-        {(product ? product.variants : [{ id: "new", name: form.variantName, uom: form.uom }]).map((variant, index) => <div key={variant.id} className="field-span">
-          <h3>{variant.name} ({index === 0 ? form.uom : variant.uom})</h3>
-          <div className="form-grid">
-            <label className="field-label">Minimum stock ({index === 0 ? form.uom : variant.uom})<input required type="number" min="0" step="1" value={index === 0 ? form.reorderPoint : stockLevels[variant.id]?.minimum ?? "0"} onChange={(event) => index === 0 ? setForm((current) => ({ ...current, reorderPoint: event.target.value })) : setStockLevels((current) => ({ ...current, [variant.id]: { ...current[variant.id], minimum: event.target.value } }))} /></label>
-            <label className="field-label">Medium stock ({index === 0 ? form.uom : variant.uom})<input type="number" min="0" step="1" value={stockLevels[variant.id]?.medium ?? ""} onChange={(event) => setStockLevels((current) => ({ ...current, [variant.id]: { ...current[variant.id], medium: event.target.value } }))} /></label>
-            <label className="field-label">Maximum stock ({index === 0 ? form.uom : variant.uom})<input type="number" min="0" step="1" value={stockLevels[variant.id]?.maximum ?? ""} onChange={(event) => setStockLevels((current) => ({ ...current, [variant.id]: { ...current[variant.id], maximum: event.target.value } }))} /></label>
-          </div>
-        </div>)}
-      </div></section>
-      {error && <PageError message={error} />}{notice && <div className="success-box"><ShieldCheck size={17} />{notice}</div>}
-      <div className="form-actions"><Link className="button button-secondary" to="/products">Cancel</Link><Button type="submit" disabled={saving}>{saving ? "Saving…" : editing ? "Save changes" : "Save product"} <ChevronRight size={16} /></Button></div>
-    </form>
-  </>;
-}
-
 function InventoryPage(): React.JSX.Element {
+  const { user } = useContext(SessionContext);
   const location = useLocation();
   const products = useLoad<{ items: Product[] }>("/products");
   const receiptQuery = new URLSearchParams(location.search);
@@ -904,7 +852,7 @@ function InventoryPage(): React.JSX.Element {
             setError(""); setMessage("");
           }}>
             <option value="">Choose a product</option>
-            {modal === "in" && <option value="new">+ Add new product</option>}
+            {modal === "in" && user?.role === "owner" && <option value="new">+ Add new product</option>}
             {variants.map((variant) => <option value={variant.id} key={variant.id}>{variant.productName} · {variant.name} ({variant.sku}){variant.description ? ` — ${variant.description}` : ""}</option>)}
           </select>
         </label>
@@ -970,8 +918,10 @@ function Modal({ title, children, onClose, eyebrow = "INVENTORY" }: { title: str
 }
 
 function CustomersPage(): React.JSX.Element {
+  const location = useLocation();
   const { data, loading, error, reload } = useLoad<{ items: Customer[] }>("/customers");
-  const [search, setSearch] = useState("");
+  const [search, setSearch] = useState(() => new URLSearchParams(location.search).get("search") ?? "");
+  useEffect(() => { setSearch(new URLSearchParams(location.search).get("search") ?? ""); }, [location.search]);
   const [modal, setModal] = useState(false);
   const [message, setMessage] = useState("");
   const rows = (data?.items ?? []).filter((customer) => `${customer.name} ${customer.email ?? ""} ${customer.phone ?? ""}`.toLowerCase().includes(search.toLowerCase()));

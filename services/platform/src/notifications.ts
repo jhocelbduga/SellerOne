@@ -2,11 +2,14 @@ import { randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { InventoryError, InventoryStore } from "@sellerone/inventory-service";
 import { InventoryAlertSettings } from "./inventory-alerts.js";
+import { ProductLifecycle } from "./product-lifecycle.js";
 
 export class NotificationStore {
   readonly settings: InventoryAlertSettings;
+  readonly lifecycle: ProductLifecycle;
   constructor(private readonly db: DatabaseSync, private readonly inventory: InventoryStore) {
     this.settings = new InventoryAlertSettings(db);
+    this.lifecycle = new ProductLifecycle(db);
     db.exec(`
       CREATE TABLE IF NOT EXISTS stock_notifications (
         id TEXT PRIMARY KEY,
@@ -74,19 +77,22 @@ export class NotificationStore {
 
   list(userId: string): { items: Record<string, unknown>[]; unreadCount: number } {
     this.sync();
-    if (!this.settings.receives(userId)) return { items: [], unreadCount: 0 };
-    const items = this.db.prepare(`
+    const items: Record<string, unknown>[] = this.settings.receives(userId) ? this.db.prepare(`
       SELECT n.id, n.details_json, n.created_at AS createdAt, r.read_at AS readAt
       FROM stock_notifications n LEFT JOIN notification_reads r ON r.notification_id = n.id AND r.user_id = ?
       WHERE n.resolved_at IS NULL AND r.read_at IS NULL ORDER BY n.created_at DESC, n.id
     `).all(userId).map(({ details_json, ...row }) => ({
       ...row, ...JSON.parse(String(details_json)) as Record<string, unknown>, status: row.readAt ? "read" : "unread",
-    }));
+    })) : [];
+    items.push(...this.lifecycle.notifications(userId));
+    items.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)) || String(b.id).localeCompare(String(a.id)));
     return { items, unreadCount: items.length };
   }
 
   view(id: string, userId: string): { items: Record<string, unknown>[]; unreadCount: number; notification: Record<string, unknown> } {
     this.sync();
+    const lifecycle = this.lifecycle.view(id, userId);
+    if (lifecycle) return { ...this.list(userId), notification: lifecycle };
     if (!this.settings.receives(userId)) throw new InventoryError("This stock notification is not assigned to you.", 403);
     const entry = this.db.prepare("SELECT id FROM stock_notifications WHERE id = ? AND resolved_at IS NULL").get(id);
     if (!entry) throw new InventoryError("Notification is no longer active. Refresh the notification list.", 404);

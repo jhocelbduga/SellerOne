@@ -9,6 +9,7 @@ import nodemailer from "nodemailer";
 import type { Transporter } from "nodemailer";
 import sharp from "sharp";
 import { InventoryError, InventoryStore } from "@sellerone/inventory-service";
+import { CatalogueMetadata } from "./catalogue.js";
 import { CHANNELS, CommerceStore } from "./commerce.js";
 import { BomStore } from "./bom.js";
 import { NotificationStore } from "./notifications.js";
@@ -231,6 +232,7 @@ db.exec(`
 
 migrateWorkspaceRoles(db);
 const inventory = new InventoryStore(db);
+const catalogue = new CatalogueMetadata(db);
 const materialBoms = new BomStore(db);
 const notifications = new NotificationStore(db, inventory);
 db.exec(`CREATE TABLE IF NOT EXISTS user_profile_pictures (
@@ -675,7 +677,28 @@ async function api(
   }
 
   const user = requireUser(parseUser(request));
-  if (!canAccessApi(user.role, path[0], method)) throw new AppError("Your workspace role does not have access to this resource.", 403);
+  if (!canAccessApi(user.role, path[0], method)) throw new AppError(["products", "variants", "raw-material-bom"].includes(path[0]) && method !== "GET" ? "Only Workspace Owners can modify catalogue records." : "Your workspace role does not have access to this resource.", 403);
+  if (path[0] === "product-lifecycle" && path.length === 2) {
+    if (method === "GET") { sendJson(response, 200, notifications.lifecycle.history(path[1])); return; }
+    if (method === "POST") {
+      requireAdmin(user);
+      const body = await readBody(request);
+      const actor = requireUser(parseUser(request)); requireAdmin(actor);
+      db.exec("SAVEPOINT retire_product");
+      try {
+        const result = notifications.lifecycle.change(path[1], body, actor);
+        notifications.sync();
+        db.exec("RELEASE retire_product");
+        sendJson(response, 200, result); return;
+      } catch (error) { db.exec("ROLLBACK TO retire_product; RELEASE retire_product"); throw error; }
+    }
+    throw new AppError("Product lifecycle endpoint not found.", 404);
+  }
+  if (path[0] === "product-images" && path.length === 3 && method === "GET") {
+    const image = catalogue.image(path[1], path[2]);
+    response.writeHead(200, { "content-type": "image/webp", "cache-control": "private, no-store", "x-content-type-options": "nosniff" });
+    response.end(image); return;
+  }
   if (path[0] === "inventory-alerts" && path.length === 1) {
     requireAdmin(user);
     if (method === "GET") { sendJson(response, 200, notifications.settings.read()); return; }
@@ -969,11 +992,15 @@ async function api(
       sendJson(response, 200, materialBoms.list());
       return;
     }
-    requireAdmin(user);
+    if (user.role !== "owner") throw new AppError("Only Workspace Owners can modify catalogue records.", 403);
     if (path.length === 3 && path[1] === "materials" && method === "PATCH") {
-      materialBoms.classify(path[2], (await readBody(request)).isRawMaterial);
+      const body = await readBody(request);
+      if (parseUser(request)?.role !== "owner") throw new AppError("Only Workspace Owners can modify catalogue records.", 403);
+      materialBoms.classify(path[2], body.isRawMaterial);
     } else if (path.length === 2 && method === "PUT") {
-      materialBoms.save(path[1], await readBody(request));
+      const body = await readBody(request);
+      if (parseUser(request)?.role !== "owner") throw new AppError("Only Workspace Owners can modify catalogue records.", 403);
+      materialBoms.save(path[1], body);
     } else if (path.length === 2 && method === "DELETE") {
       materialBoms.remove(path[1]);
     } else throw new AppError("BOM endpoint not found.", 404);
@@ -1273,21 +1300,71 @@ async function inventoryApi(
   method: string,
 ): Promise<void> {
   const search = (name: string) => url.searchParams.get(name) || undefined;
-  const body = async () => readBody(request);
+  const body = async () => {
+    const data = await readBody(request, ["products", "variants"].includes(path[0]) ? 22 * 1024 * 1024 : 1024 * 1024);
+    if (["products", "variants"].includes(path[0]) && parseUser(request)?.role !== "owner") throw new AppError("Only Workspace Owners can modify catalogue records.", 403);
+    return data;
+  };
+  const saveCatalogue = async (id?: string, fullSheet = false): Promise<object> => {
+    const data = await body();
+    const current = id ? db.prepare("SELECT active FROM products WHERE id = ?").get(id) : undefined;
+    if (data.active !== undefined && (typeof data.active !== "boolean" || data.active !== (id ? Boolean(current?.active) : true))) throw new AppError("Use the product retirement workflow with a reason to change lifecycle status.");
+    const metadata = await catalogue.prepare(data, id);
+    if (parseUser(request)?.role !== "owner") throw new AppError("Only Workspace Owners can modify catalogue records.", 403);
+    db.exec("SAVEPOINT catalogue_save");
+    try {
+      if (id && data.active !== undefined && data.active !== Boolean(db.prepare("SELECT active FROM products WHERE id = ?").get(id)?.active)) throw new AppError("Product lifecycle changed while processing the edit. Refresh before saving.", 409);
+      let product: object;
+      if (!id) {
+        product = inventory.createProduct(data as never);
+        if ("id" in product && typeof product.id === "string" && data.active !== undefined) {
+          if (typeof data.active !== "boolean") throw new AppError("Product status must be a boolean.");
+          product = inventory.updateProduct(product.id, { active: data.active });
+        }
+      }
+      else {
+        if (fullSheet) {
+          if (data.expectedUpdatedAt !== undefined && data.expectedUpdatedAt !== db.prepare("SELECT updated_at FROM products WHERE id = ?").get(id)?.updated_at) throw new AppError("This product changed while you were editing. Reload and review the latest details before saving.", 409);
+          if (typeof data.name !== "string" || !data.name.trim() || !Array.isArray(data.variants) || !data.variants.length) throw new AppError("Complete the product name and all required variant information.");
+          const ids = db.prepare("SELECT id FROM variants WHERE product_id = ?").all(id).map((row) => String(row.id));
+          const seen = new Set<string>();
+          for (const value of data.variants) {
+            if (!value || typeof value !== "object" || Array.isArray(value)) throw new AppError("Variant information is invalid.");
+            const variant = value as Record<string, unknown>;
+            if (typeof variant.id !== "string" || !ids.includes(variant.id) || seen.has(variant.id)) throw new AppError("Variant IDs must belong to this product and be unique.");
+            seen.add(variant.id);
+            for (const field of ["name", "sku", "uom", "currency"]) if (typeof variant[field] !== "string" || !String(variant[field]).trim()) throw new AppError(`Complete variant ${field}.`);
+            if (variant.unitCostMinor === undefined || variant.reorderPoint === undefined) throw new AppError("Complete variant cost and minimum stock.");
+            inventory.updateVariant(variant.id, variant);
+          }
+          if (seen.size !== ids.length) throw new AppError("Include every existing variant in the product information sheet.");
+        }
+        product = inventory.updateProduct(id, { ...data, name: text(data.name ?? db.prepare("SELECT name FROM products WHERE id = ?").get(id)?.name, "Product name") });
+      }
+      if (!("id" in product) || typeof product.id !== "string") throw new Error("Invalid saved product.");
+      catalogue.save(product.id, metadata);
+      notifications.sync();
+      db.exec("RELEASE catalogue_save");
+      return catalogue.enrich(product);
+    } catch (error) {
+      db.exec("ROLLBACK TO catalogue_save; RELEASE catalogue_save"); throw error;
+    }
+  };
   let result: object;
   let status = 200;
   if (path[0] === "products" && path[1] === "lookup" && method === "GET") {
     result = inventory.lookupProduct(text(search("code"), "Product code"));
   } else if (path[0] === "products" && path.length === 1 && method === "GET") {
-    result = { items: inventory.listProducts(search("search")) };
+    result = { items: inventory.listProducts(search("search")).map((product) => catalogue.enrich(product)) };
   } else if (path[0] === "products" && path.length === 1 && method === "POST") {
-    const data = await body();
-    result = inventory.createProduct(data as never);
+    result = await saveCatalogue();
     status = 201;
   } else if (path[0] === "products" && path.length === 2 && method === "GET") {
-    result = inventory.getProduct(path[1]);
+    result = catalogue.enrich(inventory.getProduct(path[1]));
+  } else if (path[0] === "products" && path.length === 3 && path[2] === "sheet" && method === "PUT") {
+    result = await saveCatalogue(path[1], true);
   } else if (path[0] === "products" && path.length === 2 && method === "PATCH") {
-    result = inventory.updateProduct(path[1], await body());
+    result = await saveCatalogue(path[1]);
   } else if (path[0] === "products" && path[2] === "variants" && path.length === 3 && method === "POST") {
     result = inventory.createVariant(path[1], await body() as never);
     status = 201;
@@ -1306,7 +1383,9 @@ async function inventoryApi(
       lowStockOnly: search("lowStock") === "true",
     }) };
   } else if (path[0] === "stock" && path[1] === "in" && path.length === 2 && method === "POST") {
-    result = inventory.stockIn(await body() as never);
+    const data = await body();
+    const retired = typeof data.variantId === "string" && !!db.prepare("SELECT 1 FROM variants v JOIN product_lifecycle l ON l.product_id = v.product_id WHERE v.id = ? AND l.status IN ('eol','discontinued','archived')").get(data.variantId);
+    result = inventory.stockIn(data as never, { allowInactiveProduct: retired });
     status = 201;
   } else if (path[0] === "stock" && path[1] === "out" && path.length === 2 && method === "POST") {
     result = inventory.stockOut(await body() as never);

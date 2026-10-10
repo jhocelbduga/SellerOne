@@ -30,7 +30,7 @@ export function RawMaterialBomPage({ enabled, role }: { enabled: boolean; role: 
   const [problem, setProblem] = useState("");
   const [notice, setNotice] = useState("");
   const [confirmDelete, setConfirmDelete] = useState(false);
-  const canEdit = isAdmin(role);
+  const canEdit = role === "owner";
   const variants = data?.variants ?? [];
   const materials = variants.filter((variant) => variant.isRawMaterial);
   const outputs = variants.filter((variant) => !variant.isRawMaterial);
@@ -65,11 +65,11 @@ export function RawMaterialBomPage({ enabled, role }: { enabled: boolean; role: 
       components: components.map((entry) => ({ variantId: entry.variantId, quantity: Number(entry.quantity), uom: entry.uom })),
     }, "BOM saved. Catalog, stock, and orders were not changed.");
   };
-  if (!enabled) return <section className="panel form-panel"><h1>Raw Material BOM</h1><p>This optional view is disabled. Saved classifications and BOMs are retained.</p>{canEdit ? <Link to="/settings#preferences">Enable in Settings preferences</Link> : <p>Ask an owner or admin to enable it.</p>}<p>The standard Product catalogue remains available.</p><Link to="/products">View products</Link></section>;
+  if (!enabled) return <section className="panel form-panel"><h1>Raw Material BOM</h1><p>This optional view is disabled. Saved classifications and BOMs are retained.</p>{isAdmin(role) ? <Link to="/settings#preferences">Enable in Settings preferences</Link> : <p>Ask an owner or admin to enable it.</p>}<p>The standard Product catalogue remains available.</p><Link to="/products">View products</Link></section>;
   return <>
     <div className="page-heading"><div><span className="page-eyebrow">MATERIAL PLANNING</span><h1>Raw Material BOM</h1><p>Classify raw materials and define a single-level bill of materials for each finished-product variant.</p></div></div>
     <p>Optional planning view only. Product listings, recipe attributes, stock receipts, reservations, and order fulfillment are unchanged. Decimal BOM quantities use the exact displayed UOM; no unit conversion or automatic deduction is performed.</p>
-    {!canEdit && <p>Read-only access. Owners and admins manage classifications and BOMs.</p>}
+    {!canEdit && <p>Read-only access. Only Workspace Owners manage classifications and BOMs.</p>}
     {error && <div className="error-box" role="alert">{error}</div>}
     {problem && <div className="error-box" role="alert">{problem}</div>}
     {notice && <div className="success-box" role="status">{notice}</div>}
