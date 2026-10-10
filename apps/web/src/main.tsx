@@ -227,6 +227,7 @@ function AuthPage({ mode }: { mode: "login" | "setup" | "register" | "forgot" | 
   const location = useLocation();
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
+  const [developmentResetUrl, setDevelopmentResetUrl] = useState("");
   const [busy, setBusy] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
   const params = new URLSearchParams(location.search);
@@ -242,14 +243,16 @@ function AuthPage({ mode }: { mode: "login" | "setup" | "register" | "forgot" | 
     event.preventDefault();
     setError("");
     setMessage("");
+    setDevelopmentResetUrl("");
     setBusy(true);
     try {
       if ((mode === "setup" || mode === "register" || mode === "reset") && form.password !== form.confirmPassword) {
         throw new Error("Your passwords don’t match.");
       }
       if (mode === "forgot") {
-        const result = await api<{ message: string }>("/auth/forgot-password", { method: "POST", body: JSON.stringify({ email: form.email }) });
+        const result = await api<{ message: string; developmentResetUrl?: string }>("/auth/forgot-password", { method: "POST", body: JSON.stringify({ email: form.email }) });
         setMessage(result.message);
+        setDevelopmentResetUrl(result.developmentResetUrl ?? "");
       } else if (mode === "reset") {
         await api("/auth/reset-password", { method: "POST", body: JSON.stringify({ token, password: form.password }) });
         setMessage("Your password has been updated. You can sign in now.");
@@ -301,7 +304,8 @@ function AuthPage({ mode }: { mode: "login" | "setup" | "register" | "forgot" | 
           <div className="auth-eyebrow"><span className="eyebrow-line" /> SELLERONE WORKSPACE</div>
           <h1>{title}</h1><p className="auth-subtitle">{subtitle}</p>
           {mode === "register" && !token && <div className="notice-box">SellerOne accounts are created by a workspace owner or administrator. Open your invitation link to register.</div>}
-          {message ? <div className="success-box"><ShieldCheck size={17} /><span>{message}</span></div> : (
+          {mode === "reset" && !token && <div className="notice-box" role="alert">This reset link is missing its token. <Link to="/forgot-password">Request a new reset link</Link>.</div>}
+          {message ? <><div className="success-box"><ShieldCheck size={17} /><span>{message}</span></div>{developmentResetUrl && <div className="notice-box">Local development reset link: <a href={developmentResetUrl}>Reset your password</a></div>}</> : mode === "reset" && !token ? null : (
             <form className="auth-form" onSubmit={(event) => void onSubmit(event)}>
               {(mode === "setup" || mode === "register") && <label className="field-label">Full name<input autoComplete="name" required maxLength={200} placeholder="Your name" value={form.name} onChange={update("name")} /></label>}
               {(mode === "setup" || mode === "login" || mode === "forgot") && <label className="field-label">Work email<input type="email" autoComplete="email" required placeholder="you@yourbusiness.com" value={form.email} onChange={update("email")} /></label>}

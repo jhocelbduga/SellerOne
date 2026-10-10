@@ -302,10 +302,12 @@ separate terminals. The Vite server proxies `/api` requests to the platform API.
 
 On the first visit, create the workspace owner through the one-time setup
 screen. Additional users must be invited by an owner or admin and complete
-registration using the invitation link. Password reset links are logged to the
-platform process in development when SMTP is not configured. Configure
-`SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, and `SMTP_FROM` to send
-reset emails. Use HTTPS in production so session cookies remain protected.
+registration using the invitation link. Without SMTP, local development
+displays a reset link directly in the browser. Configure `SMTP_HOST`,
+`SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, and `SMTP_FROM` to send reset emails;
+set `APP_URL` to the public application base URL if it differs from the request
+origin. Password reset email delivery is required when `NODE_ENV=production`.
+Use HTTPS in production so session cookies remain protected.
 
 The platform and inventory data share `DATABASE_PATH` (default
 `.data/sellerone.sqlite`). Set `DATABASE_PATH` to a persistent writable path for

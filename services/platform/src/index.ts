@@ -578,30 +578,39 @@ async function api(
   }
 
   if (path[0] === "auth" && path[1] === "forgot-password" && method === "POST") {
+    if (!mailer && process.env.NODE_ENV === "production") {
+      throw new AppError("Password reset email is not configured. Contact your workspace administrator.", 503);
+    }
     const body = await readBody(request);
     const email = emailAddress(body.email);
     const user = db.prepare("SELECT id FROM users WHERE email = ? COLLATE NOCASE AND active = 1").get(email);
+    const token = randomBytes(32).toString("base64url");
+    const baseUrl = process.env.APP_URL?.replace(/\/+$/, "")
+      || new URL(request.headers.origin ?? `http://${request.headers.host ?? "localhost"}`).origin;
+    const resetUrl = `${baseUrl}/reset-password?token=${encodeURIComponent(token)}`;
     if (user) {
-      const token = randomBytes(32).toString("base64url");
       const expiresAt = new Date(Date.now() + TOKEN_LIFETIME_MS).toISOString();
       db.prepare("INSERT INTO password_resets (token_hash, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)")
         .run(hashToken(token), String(user.id), expiresAt, nowIso());
-      const baseUrl = process.env.APP_URL ?? `http://localhost:${PORT}`;
-      const resetUrl = `${baseUrl}/reset-password?token=${encodeURIComponent(token)}`;
       if (mailer) {
-        await mailer.sendMail({
-          from: process.env.SMTP_FROM ?? "SellerOne <no-reply@sellerone.local>",
-          to: email,
-          subject: "Reset your SellerOne password",
-          text: `Use this link within one hour to reset your password:\n\n${resetUrl}`,
-        });
-      } else if (process.env.NODE_ENV !== "production") {
-        console.info(`Password reset link for ${email}: ${resetUrl}`);
-      } else {
-        console.error("Password reset requested but SMTP_HOST is not configured.");
+        try {
+          await mailer.sendMail({
+            from: process.env.SMTP_FROM ?? "SellerOne <no-reply@sellerone.local>",
+            to: email,
+            subject: "Reset your SellerOne password",
+            text: `Use this link within one hour to reset your password:\n\n${resetUrl}`,
+          });
+        } catch (error) {
+          db.prepare("DELETE FROM password_resets WHERE token_hash = ?").run(hashToken(token));
+          console.error("Could not send password reset email:", error);
+          throw new AppError("Unable to send reset instructions right now. Please try again later.", 503);
+        }
       }
     }
-    sendJson(response, 200, { message: "If an active account matches that email, password reset instructions will be sent." });
+    sendJson(response, 200, {
+      message: "If an active account matches that email, password reset instructions will be sent.",
+      ...(process.env.NODE_ENV !== "production" && !mailer ? { developmentResetUrl: resetUrl } : {}),
+    });
     return;
   }
 
