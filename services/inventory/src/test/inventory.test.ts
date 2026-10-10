@@ -69,6 +69,102 @@ async function createProduct(reorderPoint = 0, description?: string): Promise<{ 
 }
 
 describe("inventory service", () => {
+  it("defines UOM on variants and the first receipt, then protects historical quantities", async () => {
+    const created = await request("/products", "POST", {
+      name: "Measured goods",
+      variants: [
+        { name: "Bulk", uom: " KG ", unitCostMinor: 100, currency: "PHP" },
+        { name: "Packed", unitCostMinor: 200, currency: "PHP" },
+      ],
+    });
+    assert.equal(created.status, 201);
+    const variants = created.body.variants as JsonObject[];
+    const bulk = variants.find((variant) => variant.name === "Bulk")!;
+    const packed = variants.find((variant) => variant.name === "Packed")!;
+    assert.equal(bulk.uom, "kg");
+    assert.equal(packed.uom, "pcs");
+    assert.equal(packed.uomLocked, false);
+
+    const edited = await request(`/variants/${packed.id}`, "PATCH", { uom: " Pack " });
+    assert.equal(edited.status, 200);
+    const receipt = await request("/stock/in", "POST", { variantId: packed.id, quantity: 4, uom: " BOX " });
+    assert.equal(receipt.status, 201);
+    assert.equal(receipt.body.uom, "box");
+    assert.equal(receipt.body.quantityOnHand, 4);
+    assert.equal((await request("/stock/in", "POST", { variantId: packed.id, quantity: 2, uom: "box" })).status, 201);
+    const conflict = await request("/stock/in", "POST", { variantId: packed.id, quantity: 1, uom: "pcs" });
+    assert.equal(conflict.status, 409);
+    assert.match(String(conflict.body.error), /UOM cannot be changed/);
+    assert.equal((await request(`/variants/${packed.id}`, "PATCH", { uom: "pcs" })).status, 409);
+    assert.equal((await request(`/variants/${packed.id}`, "PATCH", { uom: " BOX " })).status, 200);
+
+    const stock = await request(`/stock?variantId=${packed.id}`);
+    assert.equal((stock.body.items as JsonObject[])[0].quantityOnHand, 6);
+    assert.equal((stock.body.items as JsonObject[])[0].uom, "box");
+    const batches = await request(`/batches?variantId=${packed.id}`);
+    assert.ok((batches.body.items as JsonObject[]).every((batch) => batch.uom === "box"));
+    const lowStock = await request("/alerts/low-stock");
+    assert.equal((lowStock.body.items as JsonObject[]).find((item) => item.variantId === bulk.id)?.uom, "kg");
+    const reread = await request(`/products/${created.body.id}`);
+    assert.equal((reread.body.variants as JsonObject[]).find((variant) => variant.id === packed.id)?.uomLocked, true);
+
+    const location = await request("/locations", "POST", { name: "UOM destination" });
+    const transfer = await request("/transfers", "POST", {
+      variantId: packed.id, sourceLocationId: "main", destinationLocationId: location.body.id, quantity: 2,
+    });
+    assert.equal((transfer.body.destination as JsonObject).uom, "box");
+    const adjusted = await request("/adjustments", "POST", { variantId: packed.id, countedQuantity: 3 });
+    assert.equal(adjusted.body.uom, "box");
+    assert.equal((await request("/stock/out", "POST", { variantId: packed.id, quantity: 3 })).body.uom, "box");
+    await request("/stock/out", "POST", { variantId: packed.id, locationId: location.body.id, quantity: 2 });
+    assert.equal((await request(`/variants/${packed.id}`, "PATCH", { uom: "pcs" })).status, 409);
+    const movements = await request(`/movements?variantId=${packed.id}`);
+    assert.ok((movements.body.items as JsonObject[]).every((movement) => movement.uom === "box"));
+  });
+
+  it("validates UOM and rolls back failed receipts without changing the catalog", async () => {
+    const { productId, variantId } = await createProduct();
+    for (const uom of ["", "   ", "x".repeat(31), null, 42]) {
+      assert.equal((await request(`/variants/${variantId}`, "PATCH", { uom })).status, 400);
+      assert.equal((await request("/stock/in", "POST", { variantId, quantity: 1, uom })).status, 400);
+      assert.equal((await request("/products", "POST", {
+        name: "Invalid UOM", variants: [{ name: "Standard", uom, unitCostMinor: 100, currency: "PHP" }],
+      })).status, 400);
+    }
+    assert.equal((await request("/stock/in", "POST", { variantId, quantity: 1.5, uom: "kg" })).status, 400);
+    assert.equal((await request("/stock/in", "POST", { variantId, quantity: 1, uom: "kg", expiresAt: "2027-02-30" })).status, 400);
+    const product = await request(`/products/${productId}`);
+    assert.equal((product.body.variants as JsonObject[])[0].uom, "pcs");
+    assert.equal((product.body.variants as JsonObject[])[0].uomLocked, false);
+    assert.equal(((await request("/movements")).body.items as JsonObject[]).length, 0);
+  });
+
+  it("generates distinct persistent SKUs when omitted and preserves supplied SKUs", async () => {
+    const created = await request("/products", "POST", {
+      name: "Auto SKU product",
+      variants: [
+        { name: "Small", unitCostMinor: 100, currency: "PHP" },
+        { name: "Large", unitCostMinor: 200, currency: "PHP" },
+        { name: "Manual", sku: "MY-SKU", unitCostMinor: 100, currency: "PHP" },
+      ],
+    });
+    assert.equal(created.status, 201);
+    const variants = created.body.variants as JsonObject[];
+    const generated = variants.filter((variant) => variant.name !== "Manual");
+    for (const variant of generated) {
+      assert.match(String(variant.sku), /^SKU-[0-9A-F-]{36}$/);
+      const lookup = await request(`/products/lookup?code=${variant.sku}`);
+      assert.equal(lookup.body.id, created.body.id);
+    }
+    assert.notEqual(generated[0].sku, generated[1].sku);
+    assert.equal(variants.find((variant) => variant.name === "Manual")?.sku, "MY-SKU");
+    const reread = await request(`/products/${created.body.id}`);
+    assert.deepEqual((reread.body.variants as JsonObject[]).map((variant) => variant.sku), variants.map((variant) => variant.sku));
+    const receipt = await request("/stock/in", "POST", { variantId: generated[0].id, quantity: 3 });
+    assert.equal(receipt.status, 201);
+    assert.equal(receipt.body.sku, generated[0].sku);
+  });
+
   it("serves health status and creates searchable products with SKU lookup", async () => {
     const health = await request("/health");
     assert.equal(health.status, 200);
@@ -179,22 +275,65 @@ describe("inventory service", () => {
     assert.equal((product.body.variants as JsonObject[])[0].description, "Updated packaging details");
   });
 
-  it("migrates existing databases to add variant descriptions", async () => {
+  it("stores receipt-specific descriptions without changing the catalog", async () => {
+    const { productId, variantId } = await createProduct(0, "Catalog description");
+    for (const [description, expected] of [
+      [undefined, "Catalog description"],
+      ["  New receipt packaging  ", "New receipt packaging"],
+      ["", ""],
+    ] as const) {
+      const receipt = await request("/stock/in", "POST", {
+        variantId, quantity: 2, variantDescription: description,
+      });
+      assert.equal(receipt.status, 201);
+      const batches = await request(`/batches?variantId=${variantId}`);
+      const batch = (batches.body.items as JsonObject[]).find((item) => item.batchId === receipt.body.batchId);
+      assert.equal(batch?.variantDescription, expected);
+      assert.equal(batch?.unitCostMinor, 100);
+      const movements = await request(`/movements?variantId=${variantId}`);
+      assert.equal((movements.body.items as JsonObject[])[0].variantDescription, expected);
+    }
+    for (const invalid of [123, "x".repeat(2001)]) {
+      const rejected = await request("/stock/in", "POST", { variantId, quantity: 2, variantDescription: invalid });
+      assert.equal(rejected.status, 400);
+    }
+    const product = await request(`/products/${productId}`);
+    assert.equal((product.body.variants as JsonObject[])[0].description, "Catalog description");
+    const stock = await request(`/stock?variantId=${variantId}`);
+    assert.equal((stock.body.items as JsonObject[])[0].quantityOnHand, 6);
+  });
+
+  it("migrates existing databases to add descriptions and default UOM without altering stock", async () => {
     const directory = mkdtempSync(join(tmpdir(), "sellerone-inventory-migration-"));
     const databasePath = join(directory, "inventory.sqlite");
     const initialStore = new InventoryStore(databasePath);
+    const existing = initialStore.createProduct({
+      name: "Existing catalog",
+      variants: [{ name: "Standard", sku: "EXISTING-1", unitCostMinor: 100, currency: "PHP" }],
+    }) as JsonObject;
+    const variantId = String((existing.variants as JsonObject[])[0].id);
+    initialStore.stockIn({ variantId, quantity: 2 });
     initialStore.close();
     const legacyDatabase = new DatabaseSync(databasePath);
-    legacyDatabase.exec("ALTER TABLE variants DROP COLUMN description; ALTER TABLE batches DROP COLUMN variant_description;");
+    legacyDatabase.exec("ALTER TABLE variants DROP COLUMN description; ALTER TABLE variants DROP COLUMN uom; ALTER TABLE batches DROP COLUMN variant_description;");
     legacyDatabase.close();
 
     const migratedStore = new InventoryStore(databasePath);
     try {
+      const migrated = migratedStore.getProduct(String(existing.id)) as JsonObject;
+      const variant = (migrated.variants as JsonObject[])[0];
+      assert.equal(variant.uom, "pcs");
+      assert.equal(variant.uomLocked, true);
+      const balance = (migratedStore.listStock({ variantId }) as JsonObject[])[0];
+      assert.equal(balance.quantityOnHand, 2);
+      assert.equal(balance.uom, "pcs");
+      assert.throws(() => migratedStore.updateVariant(variantId, { uom: "kg" }), /UOM cannot be changed/);
       const product = migratedStore.createProduct({
         name: "Legacy catalog",
         variants: [{ name: "Standard", sku: "LEGACY-1", unitCostMinor: 100, currency: "PHP" }],
       }) as { variants: JsonObject[] };
       assert.equal(product.variants[0].description, null);
+      assert.equal(product.variants[0].uom, "pcs");
     } finally {
       migratedStore.close();
       rmSync(directory, { recursive: true, force: true });
@@ -336,6 +475,7 @@ describe("inventory service", () => {
         variants: [{
           name: "Standard",
           sku: "PERSIST-1",
+          uom: "liters",
           unitCostMinor: 325,
           currency: "PHP",
         }],
@@ -350,10 +490,14 @@ describe("inventory service", () => {
       reopenedStore = new InventoryStore(databasePath);
       const reopenedProduct = reopenedStore.getProduct(productId) as JsonObject;
       assert.equal(reopenedProduct.name, "Persistent Product");
+      assert.equal((reopenedProduct.variants as JsonObject[])[0].uom, "liters");
+      assert.equal((reopenedProduct.variants as JsonObject[])[0].uomLocked, true);
       const stock = reopenedStore.listStock({ variantId }) as JsonObject[];
       assert.equal(stock[0].quantityOnHand, 4);
+      assert.equal(stock[0].uom, "liters");
       const movements = reopenedStore.listMovements({ variantId, limit: 10 }) as JsonObject[];
       assert.equal(movements[0].currency, "PHP");
+      assert.equal(movements[0].uom, "liters");
       assert.equal(movements[0].totalCostMinor, 1300);
     } finally {
       if (reopenedStore) {

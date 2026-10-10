@@ -303,11 +303,16 @@ separate terminals. The Vite server proxies `/api` requests to the platform API.
 On the first visit, create the workspace owner through the one-time setup
 screen. Additional users must be invited by an owner or admin and complete
 registration using the invitation link. Without SMTP, local development
-displays a reset link directly in the browser. Configure `SMTP_HOST`,
+displays a reset link directly in the browser and explicitly states that no
+email is sent. The link works only for an active matching account. Configure `SMTP_HOST`,
 `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, and `SMTP_FROM` to send reset emails;
 set `APP_URL` to the public application base URL if it differs from the request
 origin. Password reset email delivery is required when `NODE_ENV=production`.
 Use HTTPS in production so session cookies remain protected.
+The login form supports browser/password-manager autofill using the work email
+as the username and the saved current password. Suggestions depend on saved
+credentials and browser settings; SellerOne does not store passwords in browser
+storage.
 
 The platform and inventory data share `DATABASE_PATH` (default
 `.data/sellerone.sqlite`). Set `DATABASE_PATH` to a persistent writable path for
@@ -327,6 +332,39 @@ description appears when choosing a variant for stock-in and in stock, batch,
 and movement listings. Each receipt stores a description snapshot so later
 catalog edits do not rewrite its historical identification. Existing SQLite
 databases are migrated automatically when the inventory store starts.
+In Receive stock, select a product/variant and edit the prefilled receipt
+description as needed. It affects only that receipt, not the catalog. The
+product selector also offers **Add new product**. Enter the product name,
+first variant name, unit cost, currency, and optional catalog
+variant description, then select **Save product & select**. The product is
+saved to the catalog immediately and selected for the receipt; stock is added
+only after **Confirm movement**. Cancelling the receipt retains the saved
+catalog product.
+Leave SKU blank to generate a UUID-based SKU on the server when saving, or
+enter your own unique SKU. The selected product and save confirmation display
+the saved SKU. Variant creation APIs also generate a SKU when `sku` is omitted;
+updates preserve existing SKUs unless explicitly changed.
+The stock-in API accepts optional `variantDescription` (up to 2,000 characters):
+omitting it uses the catalog description; an empty string clears it for that
+receipt. Receipt descriptions appear in batch and stock-in movement listings.
+
+Each variant has one **unit of measure (UOM)**, such as `pcs`, `kg`, `liters`,
+`box`, or a custom label (1-30 characters, trimmed and stored in lowercase).
+New and existing variants default to `pcs`. Define UOM when adding/editing a
+product or adding a new product inside Receive stock. Selecting an existing
+variant prefills its UOM; it can also be defined during its first receipt.
+After any stock movement, UOM is locked even if stock is later depleted.
+Create a new variant to use a different UOM; existing quantities are never
+converted or relabeled. Quantity, counted quantity, and reorder point remain
+whole numbers in that UOM, and unit cost is the cost per UOM.
+Stock balances, batches, movement history, and low-stock API listings include
+`uom`; product responses also include `uomLocked`. The inventory and product
+stock summaries group quantities by UOM rather than adding unlike units.
+Variant creation/update and stock-in APIs accept `uom`; omitted stock-in UOM
+uses the catalog value. A conflicting UOM after a movement returns HTTP 409.
+Legacy SQLite databases receive the `pcs` default automatically.
+Currency valuation totals remain monetary totals; the legacy `totalUnits`
+field is a raw quantity sum, not a converted quantity across different UOMs.
 
 | Method | Endpoint | Purpose |
 | --- | --- | --- |
@@ -335,7 +373,7 @@ databases are migrated automatically when the inventory store starts.
 | `GET` | `/products/:id` | Read a product and variants |
 | `PATCH` | `/products/:id` | Update product name, description, or active status |
 | `POST` | `/products/:id/variants` | Add a variant |
-| `PATCH` | `/variants/:id` | Update SKU, barcode, attributes, cost, reorder point, or status |
+| `PATCH` | `/variants/:id` | Update UOM (before movements), SKU, barcode, attributes, cost, reorder point, or status |
 | `GET` | `/products/lookup?code=` | Look up a SKU or barcode |
 | `GET`, `POST` | `/locations` | List or create stock locations |
 | `GET` | `/stock?locationId=&variantId=` | Read real-time stock by variant and location |
@@ -359,6 +397,7 @@ Create a product:
       "name": "250 g",
       "description": "Resealable pouch, dark roast",
       "sku": "COFFEE-250",
+      "uom": "pcs",
       "barcode": "1000000000250",
       "attributes": { "size": "250 g", "colour": "Dark roast" },
       "unitCostMinor": 850,

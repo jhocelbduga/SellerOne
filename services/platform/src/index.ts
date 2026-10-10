@@ -608,7 +608,9 @@ async function api(
       }
     }
     sendJson(response, 200, {
-      message: "If an active account matches that email, password reset instructions will be sent.",
+      message: process.env.NODE_ENV !== "production" && !mailer
+        ? "Email delivery is not configured in local development. Use the reset link below; it works only for an active account matching the email you entered."
+        : "If an active account matches that email, password reset instructions will be sent.",
       ...(process.env.NODE_ENV !== "production" && !mailer ? { developmentResetUrl: resetUrl } : {}),
     });
     return;

@@ -15,8 +15,9 @@ export class InventoryError extends Error {
 
 export interface VariantInput {
   name: string;
+  uom?: string;
   description?: string;
-  sku: string;
+  sku?: string;
   barcode?: string;
   attributes?: Record<string, string>;
   unitCostMinor: number;
@@ -38,6 +39,7 @@ export interface ProductPatch {
 
 export interface VariantPatch {
   name?: string;
+  uom?: string;
   description?: string | null;
   sku?: string;
   barcode?: string | null;
@@ -50,6 +52,8 @@ export interface VariantPatch {
 
 export interface StockInput {
   variantId: string;
+  uom?: string;
+  variantDescription?: string;
   locationId?: string;
   quantity: number;
   lotNumber?: string;
@@ -169,11 +173,16 @@ function stringAttributes(value: unknown): Record<string, string> {
   return attributes;
 }
 
-function validateVariant(input: VariantInput): VariantInput {
+function unitOfMeasure(value: unknown): string {
+  return requiredText(value, "UOM", 30).toLowerCase();
+}
+
+function validateVariant(input: VariantInput): VariantInput & { sku: string; uom: string } {
   return {
     name: requiredText(input.name, "variant name"),
+    uom: input.uom === undefined ? "pcs" : unitOfMeasure(input.uom),
     description: optionalText(input.description, "variant description", 2000) ?? undefined,
-    sku: requiredText(input.sku, "SKU", 100),
+    sku: input.sku === undefined ? `SKU-${randomUUID().toUpperCase()}` : requiredText(input.sku, "SKU", 100),
     barcode: optionalText(input.barcode, "barcode", 100) ?? undefined,
     attributes: stringAttributes(input.attributes),
     unitCostMinor: nonNegativeInteger(input.unitCostMinor, "unitCostMinor"),
@@ -215,6 +224,7 @@ export class InventoryStore {
         name TEXT NOT NULL,
         description TEXT,
         sku TEXT NOT NULL UNIQUE,
+        uom TEXT NOT NULL DEFAULT 'pcs',
         barcode TEXT UNIQUE,
         attributes_json TEXT NOT NULL,
         unit_cost_minor INTEGER NOT NULL CHECK (unit_cost_minor >= 0),
@@ -264,6 +274,7 @@ export class InventoryStore {
         ON movements (variant_id, sequence DESC);
     `);
     this.ensureColumn("variants", "description", "TEXT");
+    this.ensureColumn("variants", "uom", "TEXT NOT NULL DEFAULT 'pcs'");
     this.ensureColumn("batches", "variant_description", "TEXT");
     this.database.prepare(`
       INSERT OR IGNORE INTO locations (id, name, created_at)
@@ -361,7 +372,7 @@ export class InventoryStore {
 
   updateVariant(id: string, patch: VariantPatch): object {
     const existing = this.database.prepare(`
-      SELECT id, product_id AS productId, currency
+      SELECT id, product_id AS productId, currency, uom
       FROM variants WHERE id = ?
     `).get(id);
     if (!existing) {
@@ -370,6 +381,12 @@ export class InventoryStore {
 
     const fields: string[] = [];
     const values: (string | number | null)[] = [];
+    if (patch.uom !== undefined) {
+      const uom = unitOfMeasure(patch.uom);
+      this.assertUomChangeAllowed(id, String(existing.uom), uom);
+      fields.push("uom = ?");
+      values.push(uom);
+    }
     if (patch.name !== undefined) {
       fields.push("name = ?");
       values.push(requiredText(patch.name, "name"));
@@ -471,7 +488,9 @@ export class InventoryStore {
     const unitCostMinor = input.unitCostMinor === undefined
       ? Number(variant.unit_cost_minor)
       : nonNegativeInteger(input.unitCostMinor, "unitCostMinor");
-    const variantDescription = typeof variant.description === "string" ? variant.description : null;
+    const variantDescription = input.variantDescription === undefined
+      ? (typeof variant.description === "string" ? variant.description : null)
+      : optionalText(input.variantDescription, "variantDescription", 2000);
     const lotNumber = optionalText(input.lotNumber, "lotNumber", 100);
     const expiresAt = dateOnly(input.expiresAt, "expiresAt");
     const reference = optionalText(input.reference, "reference", 200);
@@ -484,6 +503,12 @@ export class InventoryStore {
     }
 
     this.transaction(() => {
+      if (input.uom !== undefined) {
+        const uom = unitOfMeasure(input.uom);
+        this.assertUomChangeAllowed(input.variantId, String(variant.uom), uom);
+        this.database.prepare("UPDATE variants SET uom = ?, updated_at = ? WHERE id = ?")
+          .run(uom, now, input.variantId);
+      }
       this.database.prepare(`
         INSERT INTO batches (
           id, variant_id, location_id, variant_description, lot_number, expires_at,
@@ -693,6 +718,7 @@ export class InventoryStore {
         p.name AS productName,
         v.name AS variantName,
         v.description AS variantDescription,
+        v.uom,
         v.sku,
         v.barcode,
         l.id AS locationId,
@@ -732,6 +758,7 @@ export class InventoryStore {
         p.name AS productName,
         v.name AS variantName,
         COALESCE(b.variant_description, v.description) AS variantDescription,
+        v.uom,
         v.sku,
         m.movement_type AS type,
         m.quantity,
@@ -802,6 +829,7 @@ export class InventoryStore {
         p.name AS productName,
         v.name AS variantName,
         COALESCE(b.variant_description, v.description) AS variantDescription,
+        v.uom,
         v.sku,
         b.location_id AS locationId,
         l.name AS locationName,
@@ -853,7 +881,8 @@ export class InventoryStore {
     }
     const variants = this.database.prepare(`
       SELECT
-        id, name, description, sku, barcode,
+        id, name, description, sku, barcode, uom,
+        EXISTS (SELECT 1 FROM movements m WHERE m.variant_id = variants.id) AS uomLocked,
         attributes_json AS attributesJson,
         unit_cost_minor AS unitCostMinor,
         currency,
@@ -871,16 +900,17 @@ export class InventoryStore {
         ...variant,
         attributes: JSON.parse(String(attributesJson)) as Record<string, string>,
         active: Number(variant.active) === 1,
+        uomLocked: Number(variant.uomLocked) === 1,
       })),
     };
   }
 
-  private insertVariant(productId: string, variant: VariantInput, now: string): void {
+  private insertVariant(productId: string, variant: VariantInput & { sku: string; uom: string }, now: string): void {
     this.database.prepare(`
       INSERT INTO variants (
-        id, product_id, name, description, sku, barcode, attributes_json,
+        id, product_id, name, description, sku, barcode, attributes_json, uom,
         unit_cost_minor, currency, reorder_point, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       randomUUID(),
       productId,
@@ -889,6 +919,7 @@ export class InventoryStore {
       variant.sku,
       variant.barcode ?? null,
       JSON.stringify(variant.attributes ?? {}),
+      variant.uom,
       variant.unitCostMinor,
       variant.currency,
       variant.reorderPoint ?? 0,
@@ -899,7 +930,7 @@ export class InventoryStore {
 
   private inventoryVariant(id: string): Record<string, unknown> {
     const variant = this.database.prepare(`
-      SELECT v.id, v.description, v.unit_cost_minor, v.currency, v.active, p.active AS product_active
+      SELECT v.id, v.description, v.uom, v.unit_cost_minor, v.currency, v.active, p.active AS product_active
       FROM variants v
       JOIN products p ON p.id = v.product_id
       WHERE v.id = ?
@@ -926,6 +957,12 @@ export class InventoryStore {
     }
   }
 
+  private assertUomChangeAllowed(variantId: string, currentUom: string, uom: string): void {
+    if (currentUom !== uom && this.database.prepare("SELECT 1 FROM movements WHERE variant_id = ? LIMIT 1").get(variantId)) {
+      throw new InventoryError("UOM cannot be changed after a stock movement. Create a new variant for a different unit of measure.", 409);
+    }
+  }
+
   private getStockItem(variantId: string, locationId: string): object {
     const row = this.database.prepare(`
       SELECT
@@ -934,6 +971,7 @@ export class InventoryStore {
         p.name AS productName,
         v.name AS variantName,
         v.description AS variantDescription,
+        v.uom,
         v.sku,
         v.barcode,
         l.id AS locationId,

@@ -35,6 +35,8 @@ interface Product {
 interface Variant {
   id: string;
   name: string;
+  uom: string;
+  uomLocked: boolean;
   description?: string | null;
   sku: string;
   barcode?: string | null;
@@ -83,6 +85,25 @@ function money(minor: unknown, currency = "PHP"): string {
 function dateLabel(value: unknown): string {
   if (!value) return "—";
   return new Intl.DateTimeFormat("en-PH", { dateStyle: "medium" }).format(new Date(String(value)));
+}
+
+function stockQuantitySummary(rows: Record<string, unknown>[]): string {
+  const totals = new Map<string, number>();
+  for (const row of rows) {
+    const uom = String(row.uom);
+    totals.set(uom, (totals.get(uom) ?? 0) + Number(row.quantityOnHand));
+  }
+  return [...totals].sort(([a], [b]) => a.localeCompare(b))
+    .map(([uom, quantity]) => `${quantity.toLocaleString()} ${uom}`).join(" · ") || "0";
+}
+
+function UomField({ value, onChange, locked = false }: { value: string; onChange: (value: string) => void; locked?: boolean }): React.JSX.Element {
+  const listId = React.useId();
+  return <label className="field-label">Unit of measure (UOM)
+    <input name="uom" required maxLength={30} value={value} onChange={(event) => onChange(event.target.value)} readOnly={locked} list={listId} placeholder="e.g. pcs, kg, liters, box" />
+    <datalist id={listId}>{["pcs", "kg", "g", "liters", "ml", "box", "pack", "meter"].map((uom) => <option key={uom} value={uom} />)}</datalist>
+    <small>{locked ? "Locked after the first stock movement. Use a new variant for a different UOM." : "One UOM per variant. Whole-number quantities only; no unit conversion. Unit cost is per UOM."}</small>
+  </label>;
 }
 
 function initials(name: string): string {
@@ -239,8 +260,9 @@ function AuthPage({ mode }: { mode: "login" | "setup" | "register" | "forgot" | 
   const update = (key: keyof typeof form) => (event: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) => {
     setForm((current) => ({ ...current, [key]: event.target.value }));
   };
-  const onSubmit = async (event: React.FormEvent) => {
+  const onSubmit = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
+    const submittedFields = new FormData(event.currentTarget);
     setError("");
     setMessage("");
     setDevelopmentResetUrl("");
@@ -266,7 +288,10 @@ function AuthPage({ mode }: { mode: "login" | "setup" | "register" | "forgot" | 
         await refresh();
         navigate("/", { replace: true });
       } else {
-        await api("/auth/login", { method: "POST", body: JSON.stringify({ email: form.email, password: form.password }) });
+        await api("/auth/login", { method: "POST", body: JSON.stringify({
+          email: String(submittedFields.get("email") ?? form.email),
+          password: String(submittedFields.get("password") ?? form.password),
+        }) });
         await refresh();
         const from = (location.state as { from?: string } | null)?.from ?? "/";
         navigate(from, { replace: true });
@@ -306,11 +331,11 @@ function AuthPage({ mode }: { mode: "login" | "setup" | "register" | "forgot" | 
           {mode === "register" && !token && <div className="notice-box">SellerOne accounts are created by a workspace owner or administrator. Open your invitation link to register.</div>}
           {mode === "reset" && !token && <div className="notice-box" role="alert">This reset link is missing its token. <Link to="/forgot-password">Request a new reset link</Link>.</div>}
           {message ? <><div className="success-box"><ShieldCheck size={17} /><span>{message}</span></div>{developmentResetUrl && <div className="notice-box">Local development reset link: <a href={developmentResetUrl}>Reset your password</a></div>}</> : mode === "reset" && !token ? null : (
-            <form className="auth-form" onSubmit={(event) => void onSubmit(event)}>
+            <form className="auth-form" autoComplete="on" onSubmit={(event) => void onSubmit(event)}>
               {(mode === "setup" || mode === "register") && <label className="field-label">Full name<input autoComplete="name" required maxLength={200} placeholder="Your name" value={form.name} onChange={update("name")} /></label>}
-              {(mode === "setup" || mode === "login" || mode === "forgot") && <label className="field-label">Work email<input type="email" autoComplete="email" required placeholder="you@yourbusiness.com" value={form.email} onChange={update("email")} /></label>}
+              {(mode === "setup" || mode === "login" || mode === "forgot") && <label className="field-label">Work email<input id="auth-email" name="email" type="email" autoComplete={mode === "login" ? "username" : "email"} autoCapitalize="none" spellCheck={false} required placeholder="you@yourbusiness.com" value={form.email} onChange={update("email")} /></label>}
               {mode === "setup" && <><label className="field-label">Business name<input required maxLength={200} placeholder="The name customers know you by" value={form.businessName} onChange={update("businessName")} /></label><label className="field-label">Business currency<select value={form.currency} onChange={update("currency")}><option value="PHP">PHP — Philippine peso</option><option value="USD">USD — US dollar</option><option value="SGD">SGD — Singapore dollar</option><option value="AUD">AUD — Australian dollar</option><option value="EUR">EUR — Euro</option><option value="GBP">GBP — British pound</option></select></label></>}
-              {(mode === "login" || mode === "setup" || mode === "register" || mode === "reset") && <label className="field-label">{mode === "login" ? <span className="label-with-link">Password <Link to="/forgot-password">Forgot password?</Link></span> : "Password"}<span className="password-wrap"><input type={showPassword ? "text" : "password"} autoComplete={mode === "login" ? "current-password" : "new-password"} minLength={10} required placeholder="At least 10 characters" value={form.password} onChange={update("password")} /><button type="button" className="password-toggle" onClick={() => setShowPassword((value) => !value)}>{showPassword ? "Hide" : "Show"}</button></span></label>}
+              {(mode === "login" || mode === "setup" || mode === "register" || mode === "reset") && <label className="field-label">{mode === "login" ? <span className="label-with-link">Password <Link to="/forgot-password">Forgot password?</Link></span> : "Password"}<span className="password-wrap"><input id="auth-password" name="password" type={showPassword ? "text" : "password"} autoComplete={mode === "login" ? "current-password" : "new-password"} minLength={10} required placeholder="At least 10 characters" value={form.password} onChange={update("password")} /><button type="button" className="password-toggle" onClick={() => setShowPassword((value) => !value)}>{showPassword ? "Hide" : "Show"}</button></span></label>}
               {(mode === "setup" || mode === "register" || mode === "reset") && <label className="field-label">Confirm password<input type="password" autoComplete="new-password" minLength={10} required placeholder="Enter it one more time" value={form.confirmPassword} onChange={update("confirmPassword")} /></label>}
               {error && <div className="error-box" role="alert">{error}</div>}
               {mode === "register" && !token ? <button className="button button-primary auth-submit" type="button" disabled>Invitation required</button> : <button className="button button-primary auth-submit" type="submit" disabled={busy}>{busy ? "One moment…" : mode === "login" ? "Sign in to your workspace" : mode === "setup" ? "Create my workspace" : mode === "register" ? "Join workspace" : mode === "forgot" ? "Send reset instructions" : "Update password"}<ChevronRight size={17} /></button>}
@@ -416,7 +441,7 @@ function DashboardPage(): React.JSX.Element {
         ]} />}
       </section>
       <section className="panel low-stock-panel"><SectionHeading title="A little heads-up" subtitle="These items are running low" action={<span className="panel-count">{data?.lowStock.length ?? 0}</span>} />
-        {loading ? <div className="list-skeleton" /> : data?.lowStock.length ? <div className="low-stock-list">{data.lowStock.map((item) => <div className="low-stock-row" key={String(item.variantId)}><span className="mini-product"><Package size={16} /></span><span className="low-stock-meta"><strong>{String(item.productName)} · {String(item.variantName)}</strong><small>SKU {String(item.sku)} <span>·</span> reorder at {String(item.reorderPoint)}</small></span><span className="stock-count">{String(item.quantityOnHand)}<small>left</small></span></div>)}<Link className="inline-link low-stock-link" to="/inventory">See all inventory <ChevronRight size={14} /></Link></div> : <EmptyState icon={<Boxes size={19} />} title="Stock looks healthy" description="We’ll give you a heads-up when something needs a restock." />}
+        {loading ? <div className="list-skeleton" /> : data?.lowStock.length ? <div className="low-stock-list">{data.lowStock.map((item) => <div className="low-stock-row" key={String(item.variantId)}><span className="mini-product"><Package size={16} /></span><span className="low-stock-meta"><strong>{String(item.productName)} · {String(item.variantName)}</strong><small>SKU {String(item.sku)} <span>·</span> reorder at {String(item.reorderPoint)} {String(item.uom)}</small></span><span className="stock-count">{String(item.quantityOnHand)}<small>{String(item.uom)} left</small></span></div>)}<Link className="inline-link low-stock-link" to="/inventory">See all inventory <ChevronRight size={14} /></Link></div> : <EmptyState icon={<Boxes size={19} />} title="Stock looks healthy" description="We’ll give you a heads-up when something needs a restock." />}
       </section>
     </div>
     <section className="welcome-banner"><div className="welcome-art"><div className="welcome-sun" /><div className="welcome-hill hill-back" /><div className="welcome-hill hill-front" /><span className="welcome-spark spark-a">✳</span><span className="welcome-spark spark-b">✳</span><span className="welcome-plant plant-a" /><span className="welcome-plant plant-b" /></div><div className="welcome-copy"><span className="soft-tag"><Sparkles size={13} /> YOUR WORKSPACE, YOUR WAY</span><h2>Small steps add up to<br />something great.</h2><p>Add a product, welcome a customer, or simply take a breath. We’ll keep everything in sync.</p><Link to="/products/new" className="inline-link">Add your first product <ChevronRight size={14} /></Link></div></section>
@@ -437,11 +462,11 @@ function ProductsPage(): React.JSX.Element {
       id: product.id, name: product.name, description: product.description ?? "",
       sku: variants.map((variant) => variant.sku).join(", "),
       price: variants[0]?.unitCostMinor ?? 0, currency: variants[0]?.currency ?? "PHP",
-      stock: 0, variants: variants.length, active: Boolean(product.active),
+      stock: "", variants: variants.length, active: Boolean(product.active),
     };
   });
   const stock = useLoad<{ items: Record<string, unknown>[] }>("/stock");
-  for (const row of rows) row.stock = (stock.data?.items ?? []).filter((item) => item.productId === row.id).reduce((sum, item) => sum + Number(item.quantityOnHand ?? 0), 0);
+  for (const row of rows) row.stock = stockQuantitySummary((stock.data?.items ?? []).filter((item) => item.productId === row.id));
   return <>
     <PageHeading eyebrow="YOUR CATALOG" title="Products" description="The things you make, source, and sell." action={<Link className="button button-primary" to="/products/new"><Plus size={17} /> Add product</Link>} />
     {error && <PageError message={error} />}
@@ -450,7 +475,7 @@ function ProductsPage(): React.JSX.Element {
         { label: "PRODUCT", render: (row) => <Link className="product-cell" to={`/products/${row.id}/edit`}><span className="product-thumb"><Package size={17} /></span><span><strong className="table-primary">{String(row.name)}</strong><small>{String(row.description) || "No description"}</small></span></Link> },
         { label: "SKU", render: (row) => <span className="mono">{String(row.sku)}</span> },
         { label: "UNIT COST", className: "align-right", render: (row) => money(row.price, String(row.currency)) },
-        { label: "IN STOCK", render: (row) => <span className="table-number">{String(row.stock)} <small>units</small></span> },
+        { label: "IN STOCK", render: (row) => <span className="table-number">{String(row.stock)}</span> },
         { label: "VARIANTS", render: (row) => String(row.variants) },
         { label: "STATUS", render: (row) => <StatusPill status={row.active ? "Active" : "Archived"} /> },
         { label: "", render: (row) => <Link className="row-action" to={`/products/${row.id}/edit`}>Edit <ChevronRight size={14} /></Link> },
@@ -469,7 +494,7 @@ function ProductFormPage(): React.JSX.Element {
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const product = editing ? existing.data : null;
-  const [form, setForm] = useState({ name: "", description: "", variantName: "Standard", variantDescription: "", sku: "", barcode: "", unitCost: "", currency: "PHP", reorderPoint: "0", attributes: "" });
+  const [form, setForm] = useState({ name: "", description: "", variantName: "Standard", variantDescription: "", uom: "pcs", sku: "", barcode: "", unitCost: "", currency: "PHP", reorderPoint: "0", attributes: "" });
   const [initialized, setInitialized] = useState(false);
   useEffect(() => {
     if (product && !initialized) {
@@ -479,6 +504,7 @@ function ProductFormPage(): React.JSX.Element {
         description: product.description ?? "",
         variantName: variant?.name ?? "",
         variantDescription: variant?.description ?? "",
+        uom: variant?.uom ?? "pcs",
         sku: variant?.sku ?? "",
         barcode: variant?.barcode ?? "",
         unitCost: variant ? (variant.unitCostMinor / 100).toFixed(2) : "",
@@ -501,7 +527,7 @@ function ProductFormPage(): React.JSX.Element {
         await api(`/products/${id}`, { method: "PATCH", body: JSON.stringify({ name: form.name, description: form.description || null }) });
         const variant = product.variants[0];
         if (variant) await api(`/variants/${variant.id}`, { method: "PATCH", body: JSON.stringify({
-          name: form.variantName, description: form.variantDescription || null, sku: form.sku, barcode: form.barcode || null, attributes,
+          name: form.variantName, description: form.variantDescription || null, uom: form.uom, sku: form.sku, barcode: form.barcode || null, attributes,
           unitCostMinor: Math.round(Number(form.unitCost) * 100), currency: form.currency,
           reorderPoint: Number(form.reorderPoint),
         }) });
@@ -511,7 +537,7 @@ function ProductFormPage(): React.JSX.Element {
         await api("/products", { method: "POST", body: JSON.stringify({
           name: form.name, description: form.description || undefined,
           variants: [{
-            name: form.variantName, sku: form.sku, barcode: form.barcode || undefined,
+            name: form.variantName, uom: form.uom, sku: form.sku, barcode: form.barcode || undefined,
             description: form.variantDescription || undefined,
             attributes, unitCostMinor: Math.round(Number(form.unitCost) * 100),
             currency: form.currency, reorderPoint: Number(form.reorderPoint),
@@ -531,6 +557,7 @@ function ProductFormPage(): React.JSX.Element {
     <form className="form-layout" onSubmit={(event) => void submit(event)}>
       <section className="panel form-panel"><SectionHeading title="The basics" subtitle="A clear name makes everything easier." /><div className="form-grid"><label className="field-label field-span">Product name<input required maxLength={200} placeholder="e.g. House blend coffee" value={form.name} onChange={input("name")} /></label><label className="field-label field-span">Description <span className="field-optional">OPTIONAL</span><textarea rows={3} maxLength={2000} placeholder="What makes this one special?" value={form.description} onChange={input("description")} /></label></div></section>
       <section className="panel form-panel"><SectionHeading title="First variant" subtitle="Add sizes, colours, or other options later." /><div className="form-grid"><label className="field-label">Variant name<input required maxLength={200} placeholder="Standard" value={form.variantName} onChange={input("variantName")} /></label><label className="field-label">Variant description <span className="field-optional">OPTIONAL</span><textarea rows={2} maxLength={2000} placeholder="Identify this variant for receiving and stock reports" value={form.variantDescription} onChange={input("variantDescription")} /></label><label className="field-label">SKU<input required maxLength={100} placeholder="e.g. COFFEE-250" value={form.sku} onChange={input("sku")} /></label><label className="field-label">Barcode <span className="field-optional">OPTIONAL</span><input maxLength={100} placeholder="Scan or type a barcode" value={form.barcode} onChange={input("barcode")} /></label><label className="field-label">Unit cost<input required type="number" min="0" step="0.01" placeholder="0.00" value={form.unitCost} onChange={input("unitCost")} /></label><label className="field-label">Currency<select value={form.currency} onChange={input("currency")}><option value="PHP">PHP — Philippine peso</option><option value="USD">USD — US dollar</option><option value="SGD">SGD — Singapore dollar</option><option value="AUD">AUD — Australian dollar</option><option value="EUR">EUR — Euro</option><option value="GBP">GBP — British pound</option></select></label><label className="field-label">Reorder point<input required type="number" min="0" step="1" value={form.reorderPoint} onChange={input("reorderPoint")} /><small>We’ll flag stock at or below this level.</small></label><label className="field-label field-span">Variant attributes <span className="field-optional">ONE PER LINE · KEY=VALUE</span><textarea rows={3} placeholder={"size=250 g\ncolour=Dark roast"} value={form.attributes} onChange={input("attributes")} /></label></div></section>
+      <section className="panel form-panel"><UomField value={form.uom} onChange={(uom) => setForm((current) => ({ ...current, uom }))} locked={product?.variants[0]?.uomLocked} /></section>
       {error && <PageError message={error} />}{notice && <div className="success-box"><ShieldCheck size={17} />{notice}</div>}
       <div className="form-actions"><Link className="button button-secondary" to="/products">Cancel</Link><Button type="submit" disabled={saving}>{saving ? "Saving…" : editing ? "Save changes" : "Save product"} <ChevronRight size={16} /></Button></div>
     </form>
@@ -543,36 +570,87 @@ function InventoryPage(): React.JSX.Element {
   const locations = useLoad<{ items: Record<string, unknown>[] }>("/locations");
   const [tab, setTab] = useState<"stock" | "batches" | "history">("stock");
   const [modal, setModal] = useState<"in" | "out" | "adjust" | "transfer" | null>(null);
+  const [variantDescription, setVariantDescription] = useState("");
+  const [uom, setUom] = useState("pcs");
+  const [selectedVariantId, setSelectedVariantId] = useState("");
+  const [createdProduct, setCreatedProduct] = useState<Product | null>(null);
+  const [savingProduct, setSavingProduct] = useState(false);
+  const [newProduct, setNewProduct] = useState({ name: "", variantName: "Standard", uom: "pcs", sku: "", unitCost: "", currency: "PHP", description: "" });
+  useEffect(() => {
+    setVariantDescription("");
+    setSelectedVariantId("");
+    setUom("pcs");
+    setNewProduct({ name: "", variantName: "Standard", uom: "pcs", sku: "", unitCost: "", currency: "PHP", description: "" });
+  }, [modal]);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
   const refresh = () => { stock.reload(); batches.reload(); };
   const onSubmit = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault(); setMessage(""); setError("");
+    if (selectedVariantId === "new") {
+      setError("Save the new product before confirming its stock receipt.");
+      return;
+    }
     const body = Object.fromEntries(new FormData(event.currentTarget).entries());
     const endpoint = modal === "in" ? "/stock/in" : modal === "out" ? "/stock/out" : modal === "adjust" ? "/adjustments" : "/transfers";
     const payload: Record<string, unknown> = { ...body };
     for (const field of ["quantity", "countedQuantity", "unitCostMinor"]) if (payload[field] !== undefined && payload[field] !== "") payload[field] = Number(payload[field]);
     if (payload.unitCostMinor !== undefined) payload.unitCostMinor = Math.round(Number(payload.unitCostMinor) * 100);
+    if (modal === "in") {
+      payload.variantDescription = variantDescription;
+      if (body.unitCostMinor === "") delete payload.unitCostMinor;
+    }
     if (modal === "transfer") payload.sourceLocationId = payload.locationId, delete payload.locationId;
     try {
       await api(endpoint, { method: "POST", body: JSON.stringify(payload) });
-      setModal(null); setMessage("Inventory updated. Your stock counts are in sync."); refresh();
+      setModal(null); setMessage("Inventory updated. Your stock counts are in sync."); refresh(); products.reload(); setCreatedProduct(null);
     } catch (caught) { setError(caught instanceof Error ? caught.message : "Could not update stock."); }
   };
   const rows = stock.data?.items ?? [];
   const lowCount = rows.filter((row) => Number(row.quantityOnHand) <= Number(row.reorderPoint)).length;
   const products = useLoad<{ items: Product[] }>("/products");
-  const variants = products.data?.items.flatMap((product) => product.variants.map((variant) => ({ ...variant, productName: product.name }))) ?? [];
+  const catalog = products.data?.items ?? [];
+  const availableProducts = createdProduct && !catalog.some((product) => product.id === createdProduct.id) ? [...catalog, createdProduct] : catalog;
+  const variants = availableProducts.flatMap((product) => product.variants.map((variant) => ({ ...variant, productName: product.name })));
+  const saveNewProduct = async () => {
+    setError(""); setSavingProduct(true);
+    try {
+      if (!newProduct.name.trim() || !newProduct.variantName.trim() || newProduct.unitCost === "") {
+        throw new Error("Enter a product name, variant name, and unit cost.");
+      }
+      const unitCostMinor = Math.round(Number(newProduct.unitCost) * 100);
+      if (!Number.isSafeInteger(unitCostMinor) || unitCostMinor < 0) throw new Error("Enter a valid non-negative unit cost.");
+      const product = await api<Product>("/products", { method: "POST", body: JSON.stringify({
+        name: newProduct.name,
+        variants: [{
+          name: newProduct.variantName, uom: newProduct.uom, sku: newProduct.sku.trim() || undefined, description: newProduct.description || undefined,
+          unitCostMinor, currency: newProduct.currency,
+        }],
+      }) });
+      setCreatedProduct(product);
+      setSelectedVariantId(product.variants[0].id);
+      setVariantDescription(product.variants[0].description ?? "");
+      setUom(product.variants[0].uom);
+      products.reload();
+      refresh();
+      setMessage(`Product saved with SKU ${product.variants[0].sku}. Confirm the movement below to receive its stock.`);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Could not create product.");
+    } finally { setSavingProduct(false); }
+  };
+  const updateNewProduct = (field: keyof typeof newProduct) => (event: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>) => {
+    setNewProduct((current) => ({ ...current, [field]: event.target.value }));
+  };
   return <>
     <PageHeading eyebrow="STOCKROOM" title="Inventory" description="Know what you have, where it is, and when it’s time to restock." action={<div className="button-group"><Button variant="secondary" onClick={() => setModal("out")}><ArrowUpRight size={16} /> Stock out</Button><Button onClick={() => setModal("in")}><ArrowDownToLine size={16} /> Stock in</Button></div>} />
     {message && <div className="success-box"><ShieldCheck size={17} />{message}</div>}{error && <PageError message={error} />}
-    <div className="stat-grid stat-grid-three"><StatCard label="Total units on hand" value={rows.reduce((sum, row) => sum + Number(row.quantityOnHand ?? 0), 0).toLocaleString()} change="Across all locations" icon={<Boxes size={17} />} /><StatCard label="Products tracked" value={String(new Set(rows.map((row) => row.productId)).size)} change="Active in your catalog" icon={<Package size={17} />} tone="blue" /><StatCard label="Needs a restock" value={String(lowCount)} change="At or below reorder point" icon={<Bell size={17} />} tone="sand" /></div>
+    <div className="stat-grid stat-grid-three"><StatCard label="Stock on hand by UOM" value={stockQuantitySummary(rows)} change="Across all locations; units are not converted" icon={<Boxes size={17} />} /><StatCard label="Products tracked" value={String(new Set(rows.map((row) => row.productId)).size)} change="Active in your catalog" icon={<Package size={17} />} tone="blue" /><StatCard label="Needs a restock" value={String(lowCount)} change="At or below reorder point" icon={<Bell size={17} />} tone="sand" /></div>
     <section className="panel list-panel"><div className="tab-toolbar"><div className="tabs"><button className={tab === "stock" ? "tab active" : "tab"} onClick={() => setTab("stock")}>On hand <span>{rows.length}</span></button><button className={tab === "batches" ? "tab active" : "tab"} onClick={() => setTab("batches")}>Lots & batches <span>{batches.data?.items.length ?? 0}</span></button><button className={tab === "history" ? "tab active" : "tab"} onClick={() => setTab("history")}>Movement history</button></div><div className="toolbar-actions">{tab === "stock" && <Button variant="secondary" onClick={() => setModal("transfer")}><ArrowLeftRight size={15} /> Transfer</Button>}<Button variant="secondary" onClick={() => setModal("adjust")}><SlidersHorizontal size={15} /> Adjust stock</Button></div></div>
       {tab === "stock" ? <DataTable rowKey="variantId" rows={rows} empty="Add a product and receive stock to see your inventory here." columns={[
         { label: "PRODUCT / VARIANT", render: (row) => <span className="product-cell"><span className="product-thumb"><Package size={16} /></span><span><strong>{String(row.productName)} · {String(row.variantName)}</strong>{typeof row.variantDescription === "string" && row.variantDescription.length > 0 && <small>{row.variantDescription}</small>}<small className="mono">{String(row.sku)}</small></span></span> },
         { label: "LOCATION", render: (row) => String(row.locationName) },
-        { label: "ON HAND", render: (row) => <strong>{String(row.quantityOnHand)} <small className="muted">units</small></strong> },
-        { label: "REORDER AT", render: (row) => String(row.reorderPoint) },
+        { label: "ON HAND", render: (row) => <strong>{String(row.quantityOnHand)} <small className="muted">{String(row.uom)}</small></strong> },
+        { label: "REORDER AT", render: (row) => `${row.reorderPoint} ${row.uom}` },
         { label: "STATUS", render: (row) => Number(row.quantityOnHand) === 0 ? <StatusPill status="Out of stock" /> : Number(row.quantityOnHand) <= Number(row.reorderPoint) ? <StatusPill status="Low stock" /> : <StatusPill status="In stock" /> },
         { label: "VALUE", className: "align-right", render: (row) => money(Number(row.quantityOnHand) * Number(row.unitCostMinor), String(row.currency)) },
       ]} /> : tab === "batches" ? <DataTable rowKey="batchId" rows={batches.data?.items ?? []} empty="Each stock-in creates a traceable batch, complete with lot and receipt cost." columns={[
@@ -580,11 +658,58 @@ function InventoryPage(): React.JSX.Element {
         { label: "LOT / BATCH", render: (row) => <span className="mono">{String(row.lotNumber ?? "Unassigned")}</span> },
         { label: "LOCATION", render: (row) => String(row.locationName) },
         { label: "EXPIRES", render: (row) => dateLabel(row.expiresAt) },
-        { label: "ON HAND", render: (row) => `${String(row.quantityOnHand)} units` },
+        { label: "ON HAND", render: (row) => `${row.quantityOnHand} ${row.uom}` },
         { label: "RECEIPT COST", className: "align-right", render: (row) => money(row.unitCostMinor, String(row.currency)) },
       ]} /> : <MovementList />}
     </section>
-    {modal && <Modal title={modal === "in" ? "Receive stock" : modal === "out" ? "Issue stock" : modal === "adjust" ? "Adjust stock count" : "Transfer between locations"} onClose={() => setModal(null)}><form className="modal-form" onSubmit={(event) => void onSubmit(event)}><label className="field-label">Product & variant<select name="variantId" required><option value="">Choose a product</option>{variants.map((variant) => <option value={variant.id} key={variant.id}>{variant.productName} · {variant.name} ({variant.sku}){variant.description ? ` — ${variant.description}` : ""}</option>)}</select>{modal === "in" && <small>The variant description is saved with this receipt for stock history.</small>}</label>{modal === "transfer" ? <><label className="field-label">From<select name="locationId" required>{locations.data?.items.map((location) => <option key={String(location.id)} value={String(location.id)}>{String(location.name)}</option>)}</select></label><label className="field-label">To<select name="destinationLocationId" required><option value="">Choose destination</option>{locations.data?.items.map((location) => <option key={String(location.id)} value={String(location.id)}>{String(location.name)}</option>)}</select></label></> : <label className="field-label">Location<select name="locationId">{locations.data?.items.map((location) => <option key={String(location.id)} value={String(location.id)}>{String(location.name)}</option>)}</select></label>}{modal === "adjust" ? <label className="field-label">Counted quantity<input type="number" name="countedQuantity" min="0" step="1" required /></label> : <label className="field-label">Quantity<input type="number" name="quantity" min="1" step="1" required /></label>}{modal === "in" && <><label className="field-label">Unit cost<input type="number" name="unitCostMinor" min="0" step="0.01" placeholder="Leave blank to use catalog cost" /></label><label className="field-label">Lot number<input name="lotNumber" maxLength={100} /></label><label className="field-label">Expiry date<input type="date" name="expiresAt" /></label></>}<label className="field-label">Reference or note <span className="field-optional">OPTIONAL</span><input name="reference" maxLength={200} placeholder="Purchase order, reason, or note" /></label><div className="modal-actions"><Button type="button" variant="secondary" onClick={() => setModal(null)}>Cancel</Button><Button type="submit">Confirm movement <ChevronRight size={15} /></Button></div></form></Modal>}
+    {modal && <Modal title={modal === "in" ? "Receive stock" : modal === "out" ? "Issue stock" : modal === "adjust" ? "Adjust stock count" : "Transfer between locations"} onClose={() => { if (!savingProduct) setModal(null); }}>
+      <form className="modal-form" onSubmit={(event) => void onSubmit(event)}>
+        <label className="field-label">Product & variant
+          <select name="variantId" required value={selectedVariantId} disabled={savingProduct} onChange={(event) => {
+            setSelectedVariantId(event.target.value);
+            setVariantDescription(variants.find((variant) => variant.id === event.target.value)?.description ?? "");
+            setUom(variants.find((variant) => variant.id === event.target.value)?.uom ?? "pcs");
+            setError(""); setMessage("");
+          }}>
+            <option value="">Choose a product</option>
+            {modal === "in" && <option value="new">+ Add new product</option>}
+            {variants.map((variant) => <option value={variant.id} key={variant.id}>{variant.productName} · {variant.name} ({variant.sku}){variant.description ? ` — ${variant.description}` : ""}</option>)}
+          </select>
+        </label>
+        {products.error && <div className="error-box" role="alert">{products.error}</div>}
+        {modal === "in" && selectedVariantId === "new" && <section className="form-grid">
+          <label className="field-label">Product name<input maxLength={200} value={newProduct.name} onChange={updateNewProduct("name")} disabled={savingProduct} /></label>
+          <label className="field-label">Variant name<input maxLength={200} value={newProduct.variantName} onChange={updateNewProduct("variantName")} disabled={savingProduct} /></label>
+          <UomField value={newProduct.uom} onChange={(uom) => setNewProduct((current) => ({ ...current, uom }))} locked={savingProduct} />
+          <label className="field-label">SKU <span className="field-optional">AUTOMATIC IF BLANK</span><input maxLength={100} placeholder="Generated when you save the product" value={newProduct.sku} onChange={updateNewProduct("sku")} disabled={savingProduct} /></label>
+          <label className="field-label">Catalog unit cost<input type="number" min="0" step="0.01" value={newProduct.unitCost} onChange={updateNewProduct("unitCost")} disabled={savingProduct} /></label>
+          <label className="field-label">Currency<select value={newProduct.currency} onChange={updateNewProduct("currency")} disabled={savingProduct}>{["PHP", "USD", "SGD", "AUD", "EUR", "GBP"].map((currency) => <option key={currency}>{currency}</option>)}</select></label>
+          <label className="field-label field-span">Catalog variant description <span className="field-optional">OPTIONAL</span><textarea rows={2} maxLength={2000} value={newProduct.description} onChange={updateNewProduct("description")} disabled={savingProduct} /></label>
+          <small className="field-span">Saving creates a catalog product with its first variant. It does not add stock yet.</small>
+          <Button type="button" disabled={savingProduct} onClick={() => void saveNewProduct()}>{savingProduct ? "Saving product..." : "Save product & select"}</Button>
+        </section>}
+        {modal === "in" && selectedVariantId !== "new" && <UomField value={uom} onChange={setUom} locked={variants.find((variant) => variant.id === selectedVariantId)?.uomLocked} />}
+        {modal !== "in" && selectedVariantId && <p>Unit of measure: <strong>{uom}</strong>. Quantities use this UOM; no unit conversion.</p>}
+        {modal === "in" && <label className="field-label">Receipt product / variant description <span className="field-optional">OPTIONAL</span>
+          <textarea rows={3} maxLength={2000} value={variantDescription} onChange={(event) => setVariantDescription(event.target.value)} placeholder="Enter a description for the stock being received" />
+          <small>Prefilled from the selected variant. Changes apply only to this receipt, not the catalog.</small>
+        </label>}
+        {modal === "transfer" ? <>
+          <label className="field-label">From<select name="locationId" required>{locations.data?.items.map((location) => <option key={String(location.id)} value={String(location.id)}>{String(location.name)}</option>)}</select></label>
+          <label className="field-label">To<select name="destinationLocationId" required><option value="">Choose destination</option>{locations.data?.items.map((location) => <option key={String(location.id)} value={String(location.id)}>{String(location.name)}</option>)}</select></label>
+        </> : <label className="field-label">Location<select name="locationId">{locations.data?.items.map((location) => <option key={String(location.id)} value={String(location.id)}>{String(location.name)}</option>)}</select></label>}
+        {modal === "adjust" ? <label className="field-label">Counted quantity<input type="number" name="countedQuantity" min="0" step="1" required /></label> : <label className="field-label">Quantity<input type="number" name="quantity" min="1" step="1" required /></label>}
+        {modal === "in" && <>
+          <label className="field-label">Unit cost<input type="number" name="unitCostMinor" min="0" step="0.01" placeholder="Leave blank to use catalog cost" /></label>
+          <label className="field-label">Lot number<input name="lotNumber" maxLength={100} /></label>
+          <label className="field-label">Expiry date<input type="date" name="expiresAt" /></label>
+        </>}
+        <label className="field-label">Reference or note <span className="field-optional">OPTIONAL</span><input name="reference" maxLength={200} placeholder="Purchase order, reason, or note" /></label>
+        {error && <div className="error-box" role="alert">{error}</div>}
+        {message && <div className="success-box" role="status">{message}</div>}
+        <div className="modal-actions"><Button type="button" variant="secondary" disabled={savingProduct} onClick={() => setModal(null)}>Cancel</Button><Button type="submit" disabled={savingProduct || selectedVariantId === "new"}>Confirm movement <ChevronRight size={15} /></Button></div>
+      </form>
+    </Modal>}
   </>;
 }
 
@@ -596,7 +721,7 @@ function MovementList(): React.JSX.Element {
     { label: "WHEN", render: (row) => dateLabel(row.createdAt) },
     { label: "PRODUCT / VARIANT", render: (row) => <span><strong>{String(row.productName)} · {String(row.variantName)}</strong>{typeof row.variantDescription === "string" && row.variantDescription.length > 0 && <small>{row.variantDescription}</small>}<small className="mono">{String(row.sku)}</small></span> },
     { label: "MOVEMENT", render: (row) => <StatusPill status={String(row.type).replace("_", " ")} /> },
-    { label: "QUANTITY", render: (row) => { const quantity = Number(row.quantity); const delta = row.type === "stock_out" ? -quantity : quantity; return `${delta > 0 ? "+" : ""}${delta}`; } },
+    { label: "QUANTITY", render: (row) => { const quantity = Number(row.quantity); const delta = row.type === "stock_out" ? -quantity : quantity; return `${delta > 0 ? "+" : ""}${delta} ${row.uom}`; } },
     { label: "REFERENCE", render: (row) => String(row.reference ?? row.note ?? "—") },
     { label: "VALUE", className: "align-right", render: (row) => money(row.totalCostMinor, String(row.currency)) },
   ]} />;

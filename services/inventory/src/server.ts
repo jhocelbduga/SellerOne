@@ -90,8 +90,9 @@ function optionalAttributes(body: Record<string, unknown>): Record<string, strin
 function parseVariantInput(body: Record<string, unknown>): VariantInput {
   return {
     name: requiredString(body, "name"),
+    uom: optionalString(body, "uom") ?? undefined,
     description: optionalString(body, "description") ?? undefined,
-    sku: requiredString(body, "sku"),
+    sku: optionalString(body, "sku") ?? undefined,
     barcode: optionalString(body, "barcode", true) ?? undefined,
     attributes: optionalAttributes(body),
     unitCostMinor: requiredNumber(body, "unitCostMinor"),
@@ -122,6 +123,7 @@ function parseProductPatch(body: Record<string, unknown>): ProductPatch {
 function parseVariantPatch(body: Record<string, unknown>): VariantPatch {
   return {
     name: optionalString(body, "name") ?? undefined,
+    uom: optionalString(body, "uom") ?? undefined,
     description: optionalString(body, "description", true),
     sku: optionalString(body, "sku") ?? undefined,
     barcode: optionalString(body, "barcode", true),
@@ -136,6 +138,8 @@ function parseVariantPatch(body: Record<string, unknown>): VariantPatch {
 function parseStockInput(body: Record<string, unknown>): StockInput {
   return {
     variantId: requiredString(body, "variantId"),
+    uom: optionalString(body, "uom") ?? undefined,
+    variantDescription: optionalString(body, "variantDescription") ?? undefined,
     locationId: optionalString(body, "locationId") ?? undefined,
     quantity: requiredNumber(body, "quantity"),
     lotNumber: optionalString(body, "lotNumber") ?? undefined,
