@@ -269,9 +269,12 @@ This repository contains starter services for the SellerOne business domains:
 | Customers | 3003 | `GET /health` |
 | Accounting | 3004 | `GET /health` |
 
-The services currently provide basic HTTP and health-check endpoints. Business
-operations, persistence, authentication, and integrations described above are not
-implemented yet.
+The MVP includes a React web application and an authenticated platform API for
+the requested login, registration, dashboard, product, inventory, order,
+customer, sales, expense, accounting, report, settings, and user-management
+screens. Inventory uses persistent SQLite storage, FIFO valuation, and prevents
+negative stock. Orders and sales are recorded independently; creating an order
+does not reserve or deduct inventory automatically.
 
 ### Requirements
 
@@ -279,26 +282,99 @@ implemented yet.
 - npm 11 or newer
 - Docker and Docker Compose (optional, for containerized startup)
 
-### Run locally
+### Run the MVP locally
 
-Install dependencies and compile all services:
+Install dependencies and build the application:
 
 ```sh
-npm install
+npm ci
 npm run build
 ```
 
-Start one service in its own terminal:
+Run the authenticated API and serve the built web UI at `http://localhost:3100`:
 
 ```sh
-npm run start:inventory
-npm run start:orders
-npm run start:customers
-npm run start:accounting
+npm run start:platform
 ```
 
-Each service responds to `GET /health` and `GET /`. The `PORT` environment
-variable can override a service's default port.
+For local UI development, run `npm run dev:platform` and `npm run dev:web` in
+separate terminals. The Vite server proxies `/api` requests to the platform API.
+
+On the first visit, create the workspace owner through the one-time setup
+screen. Additional users must be invited by an owner or admin and complete
+registration using the invitation link. Password reset links are logged to the
+platform process in development when SMTP is not configured. Configure
+`SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, and `SMTP_FROM` to send
+reset emails. Use HTTPS in production so session cookies remain protected.
+
+The platform and inventory data share `DATABASE_PATH` (default
+`.data/sellerone.sqlite`). Set `DATABASE_PATH` to a persistent writable path for
+deployment. Do not expose the standalone inventory service publicly; the
+platform API is the authenticated UI-facing service.
+
+### Inventory API
+
+The inventory service starts with a `Main Warehouse` location. JSON request and
+response bodies use integer quantities. Monetary values are integer minor units
+(for example, cents); each variant declares its three-letter ISO currency code.
+Valuation uses FIFO by receipt cost, and stock cannot be reduced below zero.
+The standalone inventory service does not authenticate callers; keep it on a
+trusted internal network and use the platform API for authenticated UI access.
+
+| Method | Endpoint | Purpose |
+| --- | --- | --- |
+| `GET` | `/products?search=` | List and search products |
+| `POST` | `/products` | Create a product with one or more variants |
+| `GET` | `/products/:id` | Read a product and variants |
+| `PATCH` | `/products/:id` | Update product name, description, or active status |
+| `POST` | `/products/:id/variants` | Add a variant |
+| `PATCH` | `/variants/:id` | Update SKU, barcode, attributes, cost, reorder point, or status |
+| `GET` | `/products/lookup?code=` | Look up a SKU or barcode |
+| `GET`, `POST` | `/locations` | List or create stock locations |
+| `GET` | `/stock?locationId=&variantId=` | Read real-time stock by variant and location |
+| `GET` | `/batches?variantId=&locationId=&lotNumber=&includeDepleted=` | Track lots and receipt costs |
+| `POST` | `/stock/in` | Receive stock, optionally with lot, expiry, and receipt cost |
+| `POST` | `/stock/out` | Issue stock; optionally target a batch or lot number |
+| `POST` | `/adjustments` | Set a physical counted quantity and record the difference |
+| `POST` | `/transfers` | Atomically move stock between locations |
+| `GET` | `/alerts/low-stock` | List variants at or below their reorder point |
+| `GET` | `/valuation?locationId=` | Get FIFO inventory valuation grouped by currency |
+| `GET` | `/movements?variantId=&locationId=&limit=` | Read the movement and audit history |
+
+Create a product:
+
+```json
+{
+  "name": "Coffee Beans",
+  "description": "Roasted coffee",
+  "variants": [
+    {
+      "name": "250 g",
+      "sku": "COFFEE-250",
+      "barcode": "1000000000250",
+      "attributes": { "size": "250 g", "colour": "Dark roast" },
+      "unitCostMinor": 850,
+      "currency": "PHP",
+      "reorderPoint": 10
+    }
+  ]
+}
+```
+
+Receive stock:
+
+```json
+{
+  "variantId": "<variant-id>",
+  "quantity": 25,
+  "lotNumber": "LOT-2026-01",
+  "expiresAt": "2027-01-31",
+  "unitCostMinor": 850,
+  "reference": "PO-1001"
+}
+```
+
+Run the inventory service tests with `npm test`.
 
 ### Run with Docker Compose
 
@@ -306,14 +382,22 @@ variable can override a service's default port.
 docker compose up --build
 ```
 
+The web app and platform API are served together on port `3100`, with SQLite
+persisted in the `sellerone-data` volume. Configure SMTP variables in the
+environment for password reset email delivery. Put the service behind an HTTPS
+reverse proxy before production use.
+
 ### Repository layout
 
 ```text
+apps/
+  web/
 services/
   accounting/
   customers/
   inventory/
   orders/
+  platform/
 docker-compose.yml
 Dockerfile
 ```

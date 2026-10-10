@@ -1,0 +1,15 @@
+{
+  "name": "@sellerone/platform-service",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@sellerone/inventory-service": "0.1.0",
+    "nodemailer": "^10.0.16"
+  }
+}

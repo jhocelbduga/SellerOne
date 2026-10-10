@@ -1,40 +1,20 @@
 services:
-  inventory-service:
-    build:
-      context: .
-      args:
-        SERVICE_NAME: inventory
-    environment:
-      PORT: 3001
+  sellerone:
+    build: .
     ports:
-      - "3001:3001"
+      - "3100:3100"
+    environment:
+      PORT: 3100
+      DATABASE_PATH: /data/sellerone.sqlite
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_SECURE: ${SMTP_SECURE:-false}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+    volumes:
+      - sellerone-data:/data
+    restart: unless-stopped
 
-  orders-service:
-    build:
-      context: .
-      args:
-        SERVICE_NAME: orders
-    environment:
-      PORT: 3002
-    ports:
-      - "3002:3002"
-
-  customers-service:
-    build:
-      context: .
-      args:
-        SERVICE_NAME: customers
-    environment:
-      PORT: 3003
-    ports:
-      - "3003:3003"
-
-  accounting-service:
-    build:
-      context: .
-      args:
-        SERVICE_NAME: accounting
-    environment:
-      PORT: 3004
-    ports:
-      - "3004:3004"
+volumes:
+  sellerone-data:

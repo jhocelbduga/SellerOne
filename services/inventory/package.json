@@ -2,9 +2,15 @@
   "name": "@sellerone/inventory-service",
   "version": "0.1.0",
   "private": true,
+  "main": "dist/library.js",
+  "types": "dist/library.d.ts",
+  "exports": {
+    ".": "./dist/library.js"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "start": "node dist/index.js"
+    "start": "node dist/index.js",
+    "test": "npm run build && node --test dist/test/inventory.test.js"
   }
 }
