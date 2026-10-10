@@ -495,7 +495,9 @@ Settings uses separate Business details and Preferences tabs. The selected
 tab is reflected in the URL hash (`#business` or `#preferences`), including
 reloads and browser history. Arrow keys and Home/End switch tabs. Unsaved
 edits remain when switching tabs; Save settings saves only the selected
-section. Team & access opens user management.
+section and returns to the dashboard after saving and refreshing workspace
+preferences successfully. Failed saves stay on Settings with an explicit
+error and retain entered values. Team & access opens user management.
 
 Customer profiles include an editable Social media links card beside Contact
 on wide screens and stacked on small screens. Facebook, Instagram, TikTok,
@@ -513,7 +515,60 @@ Each Expenses table entry has a **View details** action that opens its full
 description, category, recorded date, amount/currency, notes, and entry ID in a
 read-only dialog. Opening details does not change or create a transaction.
 
+### Optional Raw Material BOM
+
+Owners and admins can enable **Raw Material BOM view** in Settings > Preferences.
+The separate navigation page classifies existing inventory variants as raw
+materials without filtering, hiding, duplicating, or modifying the standard
+Product catalogue. New workspaces default to disabled; disabling hides the page
+and blocks its API while retaining saved classifications and BOMs.
+
+Each active non-material finished-product variant can have one editable,
+single-level BOM: a positive output quantity in its existing UOM, notes, and
+1-100 distinct active raw-material components with positive decimal quantities
+in their own existing UOMs. Quantities are capped at 1,000,000,000. No nested BOMs,
+unit conversion, production, costing, stock deduction, or changes to order
+fulfillment are enabled. Existing recipe attributes are not imported or changed.
+Stock receipts remain whole-number quantities under existing inventory rules.
+
+Owners/admins classify materials and save or delete structures; staff can view.
+Referenced materials cannot be unclassified until removed from their BOMs, and
+a BOM output cannot become a material until its BOM is deleted. Saves validate
+all components before atomically replacing the structure. Saved UOM snapshots
+are retained and discrepancies after catalog edits are explicitly shown for
+review rather than silently converting quantities.
+
+| Method | API | Purpose |
+| --- | --- | --- |
+| GET | `/raw-material-bom` | List dedicated classifications, variants, and BOMs |
+| PATCH | `/raw-material-bom/materials/:variantId` | Set `isRawMaterial` boolean |
+| PUT | `/raw-material-bom/:variantId` | Replace BOM with `outputQuantity`, `outputUom`, `notes`, and `components` (`variantId`, `quantity`, `uom`) |
+| DELETE | `/raw-material-bom/:variantId` | Delete only the BOM structure |
+
 ### Stock planning levels
+
+The top-bar bell opens Notification management with a selectable stock
+notification list and a **per-user unread counter**. Viewing an item displays
+product, SKU, location, on-hand quantity, minimum, UOM, creation date, and read
+date; it persistently marks only that user's item read and immediately updates
+the badge. Opening the bell alone does not mark anything read. Read items remain
+selectable while their stock shortage remains active.
+
+Stock notifications are persisted as shortage episodes per variant/location.
+Changing stock or minimum while still low does not reset read status. After
+stock recovers above minimum, a later shortage creates a new unread episode.
+Inventory mutations and shipment transitions synchronize these episodes; lists
+also synchronize on retrieval. Inactive variants are excluded. Reading never
+changes stock, resolves shortages, verifies payments, or creates financial entries.
+
+`GET /notifications` returns active items and the signed-in user's `unreadCount`.
+`POST /notifications/:id/view` returns the viewed details plus the updated list
+and count. Repeated views are idempotent; inactive/resolved IDs return an error.
+Read state persists across reloads and sign-ins. Other tabs on the same browser
+refresh through BroadcastChannel when an item is viewed; other clients refresh
+on opening, route changes, window focus, and every 15 seconds. Local successful
+data mutations also refresh the bell. Loading, empty, and error states are
+explicit. Close with the close button, Escape, outside click, or tabbing out.
 
 Each variant uses its existing UOM for editable minimum, medium, and maximum
 stock levels in the product editor. The minimum is the existing `reorderPoint`:

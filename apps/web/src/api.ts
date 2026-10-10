@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
 export async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
   const response = await fetch(`/api${path}`, {
@@ -7,6 +7,7 @@ export async function api<T>(path: string, options: RequestInit = {}): Promise<T
   });
   const payload = await response.json() as Record<string, unknown>;
   if (!response.ok) throw new Error(typeof payload.error === "string" ? payload.error : `Request failed (${response.status}).`);
+  if (options.method && options.method !== "GET" && !path.startsWith("/notifications")) window.dispatchEvent(new Event("sellerone-data-changed"));
   return payload as T;
 }
 export function money(minor: unknown, currency = "PHP"): string {
@@ -16,11 +17,12 @@ export function dateLabel(value: unknown): string {
   if (!value) return "—";
   return new Intl.DateTimeFormat("en-PH", { dateStyle: "medium" }).format(new Date(String(value)));
 }
-export function useLoad<T>(path: string): { data: T | null; error: string; loading: boolean; reload: () => void } {
+export function useLoad<T>(path: string): { data: T | null; error: string; loading: boolean; reload: () => void; setData: React.Dispatch<React.SetStateAction<T | null>> } {
   const [data, setData] = useState<T | null>(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
   const [version, setVersion] = useState(0);
+  const reload = useCallback(() => setVersion((value) => value + 1), []);
   useEffect(() => {
     if (!path) { setLoading(false); setData(null); return; }
     let alive = true;
@@ -30,5 +32,5 @@ export function useLoad<T>(path: string): { data: T | null; error: string; loadi
       .finally(() => { if (alive) setLoading(false); });
     return () => { alive = false; };
   }, [path, version]);
-  return { data, error, loading, reload: () => setVersion((value) => value + 1) };
+  return { data, error, loading, reload, setData };
 }

@@ -104,6 +104,119 @@ before(async () => {
 after(async () => { await stop(); rmSync(directory, { recursive: true, force: true }); });
 
 describe("social commerce platform", () => {
+  it("persists per-user notification reads and creates new unread episodes only after recovery", async () => {
+    const created = await request("/products", "POST", { name: "Notification coffee", variants: [
+      { name: "Large", sku: "NOTIFICATION-TEST", uom: "cup", unitCostMinor: 0, currency: "PHP", reorderPoint: 10 },
+    ] });
+    const variantId = String((created.body.variants as Row[])[0].id);
+    assert.equal((await request("/notifications", "GET", undefined, "")).status, 401);
+    const list = (await request("/notifications")).body;
+    const items = list.items as Row[];
+    const notification = items.find((item) => item.variantId === variantId)!;
+    assert.ok(notification);
+    assert.equal(notification.status, "unread");
+    assert.equal(notification.quantityOnHand, 0);
+    assert.equal(notification.uom, "cup");
+    const beforeStock = await balance(variantId);
+    const viewed = await request(`/notifications/${notification.id}/view`, "POST");
+    assert.equal(viewed.status, 200);
+    assert.equal(viewed.body.unreadCount, Number(list.unreadCount) - 1);
+    assert.equal((viewed.body.notification as Row).status, "read");
+    assert.ok((viewed.body.notification as Row).readAt);
+    const readAt = (viewed.body.notification as Row).readAt;
+    const repeated = await request(`/notifications/${notification.id}/view`, "POST");
+    assert.equal(repeated.body.unreadCount, viewed.body.unreadCount);
+    assert.equal((repeated.body.notification as Row).readAt, readAt);
+    assert.deepEqual(await balance(variantId), beforeStock);
+    const staffList = (await request("/notifications", "GET", undefined, staffCookie)).body;
+    assert.equal((staffList.items as Row[]).find((item) => item.id === notification.id)?.status, "unread");
+    assert.equal((await request(`/notifications/${notification.id}/view`, "POST", undefined, staffCookie)).status, 200);
+    assert.equal((await request(`/notifications/missing/view`, "POST")).status, 404);
+    await request("/stock/in", "POST", { variantId, quantity: 10, uom: "cup" });
+    const stillLow = ((await request("/notifications")).body.items as Row[]).find((item) => item.variantId === variantId)!;
+    assert.equal(stillLow.id, notification.id);
+    assert.equal(stillLow.status, "read");
+    assert.equal(stillLow.quantityOnHand, 10);
+    await request(`/variants/${variantId}`, "PATCH", { reorderPoint: 11 });
+    assert.equal(((await request("/notifications")).body.items as Row[]).find((item) => item.variantId === variantId)?.status, "read");
+    await stop(); await start();
+    ownerCookie = (await request("/auth/login", "POST", { email: "owner@example.test", password: "Commerce-Test-2026!" }, "")).cookie;
+    staffCookie = (await request("/auth/login", "POST", { email: "staff@example.test", password: "Commerce-Staff-2026!" }, "")).cookie;
+    assert.equal(((await request("/notifications")).body.items as Row[]).find((item) => item.id === notification.id)?.readAt, readAt);
+    await request("/stock/in", "POST", { variantId, quantity: 2, uom: "cup" });
+    // Recovery and a new shortage occur between list requests.
+    await request("/stock/out", "POST", { variantId, quantity: 2, uom: "cup" });
+    const again = ((await request("/notifications")).body.items as Row[]).find((item) => item.variantId === variantId)!;
+    assert.notEqual(again.id, notification.id);
+    assert.equal(again.status, "unread");
+    assert.equal((await request(`/notifications/${notification.id}/view`, "POST")).status, 404);
+    assert.equal(((await request("/notifications", "GET", undefined, staffCookie)).body.items as Row[]).find((item) => item.id === again.id)?.status, "unread");
+    await request(`/variants/${variantId}`, "PATCH", { active: false });
+    assert.ok(!((await request("/notifications")).body.items as Row[]).some((item) => item.variantId === variantId));
+  });
+
+  it("gates a separate raw-material BOM view, validates structures and preserves catalog and stock", async () => {
+    assert.equal((await request("/settings")).body.rawMaterialBomEnabled, false);
+    assert.equal((await request("/raw-material-bom")).status, 409);
+    assert.equal((await request("/settings", "PATCH", { rawMaterialBomEnabled: "true" })).status, 400);
+    assert.equal((await request("/settings", "PATCH", { rawMaterialBomEnabled: true }, staffCookie)).status, 403);
+    assert.equal((await request("/settings", "PATCH", { rawMaterialBomEnabled: true })).status, 200);
+    const output = await product(5);
+    const rawProduct = await request("/products", "POST", { name: "BOM Milk", variants: [{ name: "Milk", sku: "BOM-MILK", uom: "litre", unitCostMinor: 0, currency: "PHP" }] });
+    const raw = String((rawProduct.body.variants as Row[])[0].id);
+    await request("/stock/in", "POST", { variantId: raw, quantity: 5, uom: "litre" });
+    const catalogBefore = (await request("/products")).body;
+    const stockBefore = (await request("/stock")).body;
+    const valid = { outputQuantity: 2, outputUom: "box", notes: "Planning only", components: [{ variantId: raw, quantity: 0.25, uom: "litre" }] };
+    assert.equal((await request(`/raw-material-bom/${output}`, "PUT", valid)).status, 400);
+    assert.equal((await request(`/raw-material-bom/materials/${raw}`, "PATCH", { isRawMaterial: true }, staffCookie)).status, 403);
+    assert.equal((await request(`/raw-material-bom/materials/${raw}`, "PATCH", { isRawMaterial: "true" })).status, 400);
+    assert.equal((await request(`/raw-material-bom/materials/missing`, "PATCH", { isRawMaterial: true })).status, 404);
+    assert.equal((await request(`/raw-material-bom/materials/${raw}`, "PATCH", { isRawMaterial: true })).status, 200);
+    assert.equal((await request(`/raw-material-bom/${output}`, "PUT", valid, staffCookie)).status, 403);
+    assert.equal((await request(`/raw-material-bom/${output}`, "PUT", valid)).status, 200);
+    const bomBefore = (await request("/raw-material-bom")).body;
+    for (const invalid of [
+      { ...valid, outputQuantity: 0 }, { ...valid, outputQuantity: -1 }, { ...valid, outputQuantity: "1" },
+      { ...valid, outputUom: "cup" }, { ...valid, notes: "x".repeat(2001) }, { ...valid, components: [] },
+      { ...valid, components: [valid.components[0], valid.components[0]] },
+      { ...valid, components: [{ variantId: raw, quantity: 1, uom: "ml" }] },
+      { ...valid, components: [{ variantId: output, quantity: 1, uom: "box" }] },
+      { ...valid, components: [{ variantId: raw, quantity: 0, uom: "litre" }] },
+      { ...valid, components: [{ variantId: raw, quantity: 1e10, uom: "litre" }] },
+    ]) assert.equal((await request(`/raw-material-bom/${output}`, "PUT", invalid)).status, 400);
+    assert.deepEqual((await request("/raw-material-bom")).body, bomBefore);
+    assert.equal((await request(`/raw-material-bom/materials/${raw}`, "PATCH", { isRawMaterial: false })).status, 409);
+    assert.equal((await request(`/raw-material-bom/materials/${output}`, "PATCH", { isRawMaterial: true })).status, 409);
+    assert.equal((await request(`/raw-material-bom/${raw}`, "PUT", { ...valid, outputUom: "litre" })).status, 400);
+    assert.equal((await request("/raw-material-bom", "GET", undefined, staffCookie)).status, 200);
+    assert.deepEqual((await request("/products")).body, catalogBefore);
+    assert.deepEqual((await request("/stock")).body, stockBefore);
+    assert.equal((await request("/settings", "PATCH", { rawMaterialBomEnabled: false })).status, 200);
+    assert.equal((await request(`/raw-material-bom/${output}`, "PUT", valid)).status, 409);
+    assert.equal((await request("/raw-material-bom")).status, 409);
+    await stop(); await start();
+    ownerCookie = (await request("/auth/login", "POST", { email: "owner@example.test", password: "Commerce-Test-2026!" }, "")).cookie;
+    staffCookie = (await request("/auth/login", "POST", { email: "staff@example.test", password: "Commerce-Staff-2026!" }, "")).cookie;
+    assert.equal((await request("/settings")).body.rawMaterialBomEnabled, false);
+    assert.equal((await request("/settings", "PATCH", { rawMaterialBomEnabled: true })).status, 200);
+    assert.deepEqual((await request("/raw-material-bom")).body, bomBefore);
+    const created = await order(output);
+    const paymentId = await payment(created);
+    assert.equal((await request(`/orders/${created.id}/verify-payment`, "POST", { paymentId })).status, 200);
+    for (const stage of ["packing", "shipped", "delivered", "completed"]) {
+      assert.equal((await request(`/orders/${created.id}`, "PATCH", { stage, ...(stage === "shipped" ? { carrier: "Test courier" } : {}) })).status, 200);
+    }
+    assert.equal((await balance(raw)).quantityOnHand, 5);
+    assert.equal((await balance(raw)).quantityReserved, 0);
+    assert.equal((await balance(output)).quantityOnHand, 3);
+    assert.equal((await request(`/raw-material-bom/${output}`, "DELETE", undefined, staffCookie)).status, 403);
+    assert.equal((await request(`/raw-material-bom/${output}`, "DELETE")).status, 200);
+    assert.equal((await request(`/raw-material-bom/${output}`, "DELETE")).status, 404);
+    assert.equal((await request(`/raw-material-bom/materials/${raw}`, "PATCH", { isRawMaterial: false })).status, 200);
+    assert.equal((await request("/settings", "PATCH", { rawMaterialBomEnabled: false })).status, 200);
+  });
+
   it("keeps shortages unverified then resumes the full workflow after receiving stock", async () => {
     const variantId = await product(0);
     const created = await order(variantId, 5, { items: [{ variantId, quantity: 2, unitPriceMinor: 500 }, { variantId, quantity: 3, unitPriceMinor: 500 }] });

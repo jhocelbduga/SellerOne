@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useEffect, useMemo, useState } from "react";
+import React, { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   Activity, ArrowDownLeft, ArrowDownToLine, ArrowLeftRight, ArrowUpRight, Bell,
@@ -14,6 +14,7 @@ import {
 import "./styles.css";
 import { api, money, dateLabel, useLoad } from "./api";
 import { CommerceOrders, CommerceOrderDetails, CheckoutPage, TrackingPage } from "./commerce";
+import { RawMaterialBomPage } from "./bom";
 
 type Role = "owner" | "admin" | "staff";
 interface User {
@@ -25,6 +26,7 @@ interface User {
 interface SessionState {
   user: User | null;
   needsSetup: boolean;
+  rawMaterialBomEnabled: boolean;
   refresh: () => Promise<void>;
 }
 interface Product {
@@ -77,6 +79,7 @@ const customerSocialPlatforms = [
 const SessionContext = createContext<SessionState>({
   user: null,
   needsSetup: false,
+  rawMaterialBomEnabled: false,
   refresh: async () => undefined,
 });
 
@@ -106,12 +109,14 @@ function initials(name: string): string {
 function SessionProvider(): React.JSX.Element {
   const [user, setUser] = useState<User | null>(null);
   const [needsSetup, setNeedsSetup] = useState(false);
+  const [rawMaterialBomEnabled, setRawMaterialBomEnabled] = useState(false);
   const [ready, setReady] = useState(false);
   const refresh = async () => {
     try {
-      const status = await api<{ user: User | null; needsSetup: boolean }>("/auth/status");
+      const status = await api<{ user: User | null; needsSetup: boolean; rawMaterialBomEnabled: boolean }>("/auth/status");
       setUser(status.user);
       setNeedsSetup(status.needsSetup);
+      setRawMaterialBomEnabled(status.rawMaterialBomEnabled);
     } finally {
       setReady(true);
     }
@@ -119,7 +124,7 @@ function SessionProvider(): React.JSX.Element {
   useEffect(() => { void refresh().catch(() => setReady(true)); }, []);
   if (!ready) return <div className="boot-screen"><span className="brand-glyph">S</span><span>Opening your workspace…</span></div>;
   return (
-    <SessionContext.Provider value={{ user, needsSetup, refresh }}>
+    <SessionContext.Provider value={{ user, needsSetup, rawMaterialBomEnabled, refresh }}>
       <Routes>
         <Route path="/login" element={<AuthPage mode="login" />} />
         <Route path="/setup" element={<AuthPage mode="setup" />} />
@@ -135,6 +140,7 @@ function SessionProvider(): React.JSX.Element {
           <Route path="products/new" element={<ProductFormPage />} />
           <Route path="products/:id/edit" element={<ProductFormPage />} />
           <Route path="inventory" element={<InventoryPage />} />
+          <Route path="raw-material-bom" element={<RawMaterialBomPage enabled={rawMaterialBomEnabled} role={user?.role ?? "staff"} />} />
           <Route path="orders" element={<CommerceOrders role={user?.role ?? "staff"} />} />
           <Route path="orders/:id" element={<CommerceOrderDetails role={user?.role ?? "staff"} />} />
           <Route path="customers" element={<CustomersPage />} />
@@ -220,13 +226,114 @@ function AccountOptions({ user, onNavigate }: { user: User; onNavigate: () => vo
   </div>;
 }
 
+function StockNotifications(): React.JSX.Element {
+  const location = useLocation();
+  const [open, setOpen] = useState(false);
+  const container = useRef<HTMLDivElement>(null);
+  const trigger = useRef<HTMLButtonElement>(null);
+  const closeButton = useRef<HTMLButtonElement>(null);
+  type Notification = {
+    id: string; status: "read" | "unread"; readAt: string | null; createdAt: string;
+    variantId: string; locationId: string; productName: string; variantName: string;
+    sku: string; locationName: string; quantityOnHand: number; reorderPoint: number; uom: string;
+  };
+  const { data, loading, error, reload, setData } = useLoad<{ items: Notification[]; unreadCount: number }>("/notifications");
+  const [selected, setSelected] = useState<Notification | null>(null);
+  const [viewing, setViewing] = useState(false);
+  const [viewError, setViewError] = useState("");
+  const channel = useRef<BroadcastChannel | null>(null);
+  const detail = useRef<HTMLHeadingElement>(null);
+  const view = async (id: string) => {
+    if (viewing) return;
+    setViewing(true); setViewError("");
+    try {
+      const result = await api<{ items: Notification[]; unreadCount: number; notification: Notification }>(`/notifications/${id}/view`, { method: "POST" });
+      setData(result); setSelected(result.notification); reload();
+      channel.current?.postMessage("read-status-changed");
+    } catch (caught) { setViewError(caught instanceof Error ? caught.message : "Could not view notification."); }
+    finally { setViewing(false); }
+  };
+  useEffect(() => { if (selected) detail.current?.focus(); }, [selected]);
+  useEffect(() => {
+    reload();
+    setOpen(false);
+    setSelected(null); setViewError("");
+  }, [location.key, reload]);
+  useEffect(() => {
+    const interval = window.setInterval(reload, 15000);
+    window.addEventListener("focus", reload);
+    window.addEventListener("sellerone-data-changed", reload);
+    if (typeof BroadcastChannel !== "undefined") {
+      const broadcast = new BroadcastChannel("sellerone-notifications");
+      broadcast.onmessage = reload;
+      channel.current = broadcast;
+    }
+    return () => {
+      window.clearInterval(interval); window.removeEventListener("focus", reload);
+      window.removeEventListener("sellerone-data-changed", reload);
+      channel.current?.close(); channel.current = null;
+    };
+  }, [reload]);
+  useEffect(() => {
+    if (!open) return;
+    closeButton.current?.focus();
+    const outside = (event: PointerEvent) => {
+      if (event.target instanceof Node && !container.current?.contains(event.target)) setOpen(false);
+    };
+    const escape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") { setOpen(false); trigger.current?.focus(); }
+    };
+    document.addEventListener("pointerdown", outside);
+    document.addEventListener("keydown", escape);
+    return () => { document.removeEventListener("pointerdown", outside); document.removeEventListener("keydown", escape); };
+  }, [open]);
+  const count = !error ? data?.unreadCount ?? 0 : 0;
+  return <div className="stock-notifications" ref={container} onBlur={(event) => {
+    if (event.relatedTarget instanceof Node && !event.currentTarget.contains(event.relatedTarget)) setOpen(false);
+  }}>
+    <button ref={trigger} className="icon-button notification-button" type="button"
+      aria-label={error ? "Notifications: unavailable" : count ? `Notifications: ${count} unread` : "Notifications"}
+      aria-expanded={open} aria-controls="stock-notifications-panel" onClick={() => { if (!open) reload(); setOpen((current) => !current); }}>
+      <Bell size={18} />{count > 0 && <span className="notification-count" aria-hidden="true">{count > 99 ? "99+" : count}</span>}
+    </button>
+    {open && <section id="stock-notifications-panel" className="notification-panel" aria-labelledby="stock-notifications-title" aria-busy={loading}>
+      <div className="notification-heading"><h2 id="stock-notifications-title">Notification management</h2><button ref={closeButton} className="icon-button" type="button" aria-label="Close notifications" onClick={() => { setOpen(false); trigger.current?.focus(); }}><X size={18} /></button></div>
+      <p role="status">{count} unread notifications</p>
+      <p>Select a stock notification to view its details and mark it read for your account.</p>
+      {viewError && <div className="error-box" role="alert">{viewError}</div>}
+      {selected && <section className="notification-detail" aria-labelledby="notification-detail-title">
+        <h3 ref={detail} tabIndex={-1} id="notification-detail-title">{selected.productName} · {selected.variantName}</h3>
+        <p>{selected.sku} · {selected.locationName}</p>
+        <p>{selected.quantityOnHand === 0 ? "Out of stock" : "Low stock"}: {selected.quantityOnHand} {selected.uom} on hand · Minimum: {selected.reorderPoint} {selected.uom}</p>
+        <p>Created: {new Date(selected.createdAt).toLocaleString()}</p>
+        <p>Status: Read{selected.readAt ? ` · ${new Date(selected.readAt).toLocaleString()}` : ""}</p>
+        <p>Reading acknowledges this notification; it does not resolve the stock shortage.</p>
+        <button className="button button-secondary" type="button" onClick={() => { setSelected(null); closeButton.current?.focus(); }}>Back to notification list</button>
+      </section>}
+      {loading ? <p role="status">Checking stock alerts...</p> : error ? <div className="error-box" role="alert">{error}</div>
+        : data?.items.length ? <><ul className="notification-list" aria-label="Selectable notifications">
+          {data.items.map((item) => <li key={item.id}>
+            <button type="button" className={`notification-item ${item.status}`} disabled={viewing} aria-pressed={selected?.id === item.id} onClick={() => void view(item.id)}>
+              <strong>{item.productName} · {item.variantName}</strong>
+              <small>{item.sku} · {item.locationName}</small>
+              <span>{item.status === "unread" ? "Unread" : "Read"} · View details</span>
+            </button>
+          </li>)}
+        </ul></> : <p role="status">No low-stock alerts. Stock is above minimum levels.</p>}
+      {viewing && <p role="status">Opening notification...</p>}
+      <div className="notification-actions"><button className="button button-secondary" type="button" disabled={loading} onClick={reload}>Refresh alerts</button><Link className="button" to="/inventory" onClick={() => setOpen(false)}>View inventory</Link></div>
+      <small>Read status is saved per user. Opening the bell alone does not mark items read. A new unread notification is created only after stock recovers above minimum and later becomes low again.</small>
+    </section>}
+  </div>;
+}
+
 function ProtectedLayout(): React.JSX.Element {
-  const { user, needsSetup } = useContext(SessionContext);
+  const { user, needsSetup, rawMaterialBomEnabled } = useContext(SessionContext);
   const location = useLocation();
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   if (needsSetup) return <Navigate to="/setup" replace />;
   if (!user) return <Navigate to="/login" state={{ from: location.pathname }} replace />;
-  const current = [...primaryNav.flatMap((section) => section.items), ...(user.role !== "staff" ? [{ to: "/settings", label: "Settings", icon: Settings }] : [])]
+  const current = [...primaryNav.flatMap((section) => section.items), { to: "/raw-material-bom", label: "Raw Material BOM", icon: Boxes }, ...(user.role !== "staff" ? [{ to: "/settings", label: "Settings", icon: Settings }] : [])]
     .find((item) => item.to === location.pathname);
   return (
     <div className="app-shell">
@@ -255,6 +362,7 @@ function ProtectedLayout(): React.JSX.Element {
           ))}
           <div className="nav-section">
             <span className="nav-heading">Workspace</span>
+            {rawMaterialBomEnabled && <Link className={`nav-link ${location.pathname === "/raw-material-bom" ? "active" : ""}`} to="/raw-material-bom" onClick={() => setMobileNavOpen(false)}><Boxes size={17} strokeWidth={1.8} /><span>Raw Material BOM</span></Link>}
             {user.role !== "staff" && <Link className={`nav-link ${location.pathname === "/users" ? "active" : ""}`} to="/users"><UserRoundPlus size={17} strokeWidth={1.8} /><span>User management</span></Link>}
             {user.role !== "staff" && <Link className={`nav-link ${location.pathname === "/settings" ? "active" : ""}`} to="/settings"><Settings size={17} strokeWidth={1.8} /><span>Settings</span></Link>}
           </div>
@@ -276,7 +384,7 @@ function ProtectedLayout(): React.JSX.Element {
           <div className="topbar-actions">
             <span className="today-label">{new Intl.DateTimeFormat("en-PH", { weekday: "short", month: "short", day: "numeric" }).format(new Date())}</span>
             <button className="icon-button search-trigger" type="button"><Search size={18} /><span>Search</span><kbd>⌘ K</kbd></button>
-            <button className="icon-button notification-button" type="button" aria-label="Notifications"><Bell size={18} /><i /></button>
+            <StockNotifications />
             <span className="avatar avatar-top">{initials(user.name)}</span>
           </div>
         </header>
@@ -1003,11 +1111,12 @@ function ReportsPage(): React.JSX.Element {
 }
 
 function SettingsPage(): React.JSX.Element {
+  const { refresh } = useContext(SessionContext);
   const location = useLocation();
   const navigate = useNavigate();
   const tab = location.hash === "#preferences" ? "preferences" : "business";
-  const { data, loading, error } = useLoad<{ businessName: string; currency: string; timezone: string; lowStockEmailAlerts: boolean }>("/settings");
-  const [form, setForm] = useState<{ businessName: string; currency: string; timezone: string; lowStockEmailAlerts: boolean } | null>(null);
+  const { data, loading, error } = useLoad<{ businessName: string; currency: string; timezone: string; lowStockEmailAlerts: boolean; rawMaterialBomEnabled: boolean }>("/settings");
+  const [form, setForm] = useState<{ businessName: string; currency: string; timezone: string; lowStockEmailAlerts: boolean; rawMaterialBomEnabled: boolean } | null>(null);
   const [notice, setNotice] = useState("");
   const [problem, setProblem] = useState("");
   const [saving, setSaving] = useState(false);
@@ -1015,9 +1124,9 @@ function SettingsPage(): React.JSX.Element {
   const change = (key: keyof NonNullable<typeof form>, value: string | boolean) => setForm((current) => current ? { ...current, [key]: value } : current);
   const save = async (event: React.FormEvent) => {
     event.preventDefault(); if (!form || saving) return; setNotice(""); setProblem(""); setSaving(true);
-    const payload = tab === "preferences" ? { lowStockEmailAlerts: form.lowStockEmailAlerts }
+    const payload = tab === "preferences" ? { lowStockEmailAlerts: form.lowStockEmailAlerts, rawMaterialBomEnabled: form.rawMaterialBomEnabled }
       : { businessName: form.businessName, currency: form.currency, timezone: form.timezone };
-    try { await api("/settings", { method: "PATCH", body: JSON.stringify(payload) }); setNotice(`${tab === "preferences" ? "Preferences" : "Business details"} saved.`); }
+    try { await api("/settings", { method: "PATCH", body: JSON.stringify(payload) }); await refresh(); navigate("/"); }
     catch (caught) { setProblem(caught instanceof Error ? caught.message : "Could not save settings."); }
     finally { setSaving(false); }
   };
@@ -1048,7 +1157,7 @@ function SettingsPage(): React.JSX.Element {
             <label className="field-label field-span">Business name<input required maxLength={200} value={form.businessName} onChange={(event) => change("businessName", event.target.value)} /></label>
             <label className="field-label">Default currency<select value={form.currency} onChange={(event) => change("currency", event.target.value)}><option value="PHP">PHP — Philippine peso</option><option value="USD">USD — US dollar</option><option value="SGD">SGD — Singapore dollar</option><option value="AUD">AUD — Australian dollar</option><option value="EUR">EUR — Euro</option><option value="GBP">GBP — British pound</option></select><small>New sales and expenses use this currency by default.</small></label>
             <label className="field-label">Time zone<input required maxLength={100} value={form.timezone} onChange={(event) => change("timezone", event.target.value)} /><small>Use an IANA name, such as Asia/Manila.</small></label>
-          </div></> : <><SectionHeading title="Preferences" subtitle="A few thoughtful nudges to help you stay ahead." /><label className="toggle-row"><span><strong>Low stock reminders</strong><small>Show inventory at or below its reorder point on your dashboard.</small></span><input type="checkbox" checked={form.lowStockEmailAlerts} onChange={(event) => change("lowStockEmailAlerts", event.target.checked)} /></label></>}
+          </div></> : <><SectionHeading title="Preferences" subtitle="A few thoughtful nudges to help you stay ahead." /><label className="toggle-row"><span><strong>Low stock reminders</strong><small>Show inventory at or below its reorder point on your dashboard.</small></span><input type="checkbox" checked={form.lowStockEmailAlerts} onChange={(event) => change("lowStockEmailAlerts", event.target.checked)} /></label><label className="toggle-row"><span><strong>Raw Material BOM view</strong><small>Show a separate material classification and BOM planning page. Does not change the Product catalogue or deduct stock. Disabling keeps saved BOMs.</small></span><input type="checkbox" checked={form.rawMaterialBomEnabled} onChange={(event) => change("rawMaterialBomEnabled", event.target.checked)} /></label></>}
         </section>
         <div className="form-actions"><Button type="submit" disabled={saving}><ShieldCheck size={16} />{saving ? "Saving..." : "Save settings"}</Button></div>
       </div>

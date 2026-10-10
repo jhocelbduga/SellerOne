@@ -9,6 +9,8 @@ import nodemailer from "nodemailer";
 import type { Transporter } from "nodemailer";
 import { InventoryError, InventoryStore } from "@sellerone/inventory-service";
 import { CHANNELS, CommerceStore } from "./commerce.js";
+import { BomStore } from "./bom.js";
+import { NotificationStore } from "./notifications.js";
 
 const scrypt = promisify(scryptCallback);
 const PORT = Number(process.env.PORT ?? 3100);
@@ -219,6 +221,8 @@ db.exec(`
 `);
 
 const inventory = new InventoryStore(db);
+const materialBoms = new BomStore(db);
+const notifications = new NotificationStore(db, inventory);
 const customerSocialFields = {
   facebookUrl: { column: "facebook_url", label: "Facebook", hosts: ["facebook.com", "fb.com"] },
   instagramUrl: { column: "instagram_url", label: "Instagram", hosts: ["instagram.com"] },
@@ -448,6 +452,7 @@ async function api(
     sendJson(response, 200, {
       needsSetup: Number(db.prepare("SELECT COUNT(*) AS count FROM users").get()?.count ?? 0) === 0,
       user: parseUser(request) ?? null,
+      rawMaterialBomEnabled: parseUser(request) ? setting("rawMaterialBomEnabled", "false") === "true" : false,
     });
     return;
   }
@@ -646,6 +651,17 @@ async function api(
   }
 
   const user = requireUser(parseUser(request));
+  if (path[0] === "notifications") {
+    if (path.length === 1 && method === "GET") {
+      sendJson(response, 200, notifications.list(user.id));
+      return;
+    }
+    if (path.length === 3 && path[2] === "view" && method === "POST") {
+      sendJson(response, 200, notifications.view(path[1], user.id));
+      return;
+    }
+    throw new AppError("Notification endpoint not found.", 404);
+  }
   if (path[0] === "me" && method === "GET") {
     sendJson(response, 200, { user });
     return;
@@ -734,6 +750,7 @@ async function api(
         currency: setting("currency", DEFAULT_CURRENCY),
         timezone: setting("timezone", "Asia/Manila"),
         lowStockEmailAlerts: setting("lowStockEmailAlerts", "false") === "true",
+        rawMaterialBomEnabled: setting("rawMaterialBomEnabled", "false") === "true",
       });
       return;
     }
@@ -761,6 +778,10 @@ async function api(
         }
         updates.push(["lowStockEmailAlerts", String(body.lowStockEmailAlerts)]);
       }
+      if (body.rawMaterialBomEnabled !== undefined) {
+        if (typeof body.rawMaterialBomEnabled !== "boolean") throw new AppError("rawMaterialBomEnabled must be true or false.");
+        updates.push(["rawMaterialBomEnabled", String(body.rawMaterialBomEnabled)]);
+      }
       db.exec("BEGIN IMMEDIATE");
       try {
         const upsert = db.prepare("INSERT OR REPLACE INTO app_settings (key, value) VALUES (?, ?)");
@@ -777,9 +798,28 @@ async function api(
         currency: setting("currency", DEFAULT_CURRENCY),
         timezone: setting("timezone", "Asia/Manila"),
         lowStockEmailAlerts: setting("lowStockEmailAlerts", "false") === "true",
+        rawMaterialBomEnabled: setting("rawMaterialBomEnabled", "false") === "true",
       });
       return;
     }
+  }
+
+  if (path[0] === "raw-material-bom") {
+    if (setting("rawMaterialBomEnabled", "false") !== "true") throw new AppError("Enable Raw Material BOM in Settings preferences first.", 409);
+    if (path.length === 1 && method === "GET") {
+      sendJson(response, 200, materialBoms.list());
+      return;
+    }
+    requireAdmin(user);
+    if (path.length === 3 && path[1] === "materials" && method === "PATCH") {
+      materialBoms.classify(path[2], (await readBody(request)).isRawMaterial);
+    } else if (path.length === 2 && method === "PUT") {
+      materialBoms.save(path[1], await readBody(request));
+    } else if (path.length === 2 && method === "DELETE") {
+      materialBoms.remove(path[1]);
+    } else throw new AppError("BOM endpoint not found.", 404);
+    sendJson(response, 200, materialBoms.list());
+    return;
   }
 
   if (path[0] === "dashboard" && method === "GET") {
@@ -916,7 +956,9 @@ async function api(
       return;
     }
     if (path.length === 2 && method === "PATCH") {
-      sendJson(response, 200, commerce.transition(path[1], await readBody(request), user));
+      const result = commerce.transition(path[1], await readBody(request), user);
+      notifications.sync();
+      sendJson(response, 200, result);
       return;
     }
     if (path.length === 3 && method === "POST") {
@@ -1133,6 +1175,7 @@ async function inventoryApi(
   } else {
     throw new AppError("Inventory endpoint not found.", 404);
   }
+  if (method !== "GET") notifications.sync();
   sendJson(response, status, result);
 }
 
