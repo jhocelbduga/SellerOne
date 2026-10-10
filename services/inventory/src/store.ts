@@ -193,12 +193,14 @@ function validateVariant(input: VariantInput): VariantInput & { sku: string; uom
 
 export class InventoryStore {
   private readonly database: DatabaseSync;
+  private readonly ownsDatabase: boolean;
 
-  constructor(databasePath: string) {
-    if (databasePath !== ":memory:") {
+  constructor(databasePath: string | DatabaseSync) {
+    if (typeof databasePath === "string" && databasePath !== ":memory:") {
       mkdirSync(dirname(databasePath), { recursive: true });
     }
-    this.database = new DatabaseSync(databasePath);
+    this.ownsDatabase = typeof databasePath === "string";
+    this.database = typeof databasePath === "string" ? new DatabaseSync(databasePath) : databasePath;
     this.database.exec(`
       PRAGMA foreign_keys = ON;
       PRAGMA journal_mode = WAL;
@@ -272,6 +274,13 @@ export class InventoryStore {
         ON movements (sequence DESC);
       CREATE INDEX IF NOT EXISTS movements_variant_history
         ON movements (variant_id, sequence DESC);
+      CREATE TABLE IF NOT EXISTS stock_reservations (
+        order_id TEXT NOT NULL,
+        variant_id TEXT NOT NULL REFERENCES variants(id),
+        location_id TEXT NOT NULL REFERENCES locations(id),
+        quantity INTEGER NOT NULL CHECK (quantity > 0),
+        PRIMARY KEY (order_id, variant_id, location_id)
+      );
     `);
     this.ensureColumn("variants", "description", "TEXT");
     this.ensureColumn("variants", "uom", "TEXT NOT NULL DEFAULT 'pcs'");
@@ -283,7 +292,46 @@ export class InventoryStore {
   }
 
   close(): void {
-    this.database.close();
+    if (this.ownsDatabase) this.database.close();
+  }
+
+  reserveStock(orderId: string, items: { variantId: string; locationId: string; quantity: number }[]): void {
+    this.transaction(() => {
+      if (this.database.prepare("SELECT 1 FROM stock_reservations WHERE order_id = ?").get(orderId)) {
+        throw new InventoryError("This order already has reserved stock.", 409);
+      }
+      for (const item of items) {
+        const variant = this.inventoryVariant(item.variantId);
+        if (Number(variant.active) !== 1 || Number(variant.product_active) !== 1) {
+          throw new InventoryError("Inactive variants cannot be reserved.", 409);
+        }
+        const locationId = this.locationId(item.locationId);
+        const quantity = positiveInteger(item.quantity, "quantity");
+        this.assertAvailable(item.variantId, locationId, quantity);
+        this.database.prepare(`INSERT INTO stock_reservations (order_id, variant_id, location_id, quantity)
+          VALUES (?, ?, ?, ?) ON CONFLICT (order_id, variant_id, location_id)
+          DO UPDATE SET quantity = quantity + excluded.quantity`).run(orderId, item.variantId, locationId, quantity);
+      }
+    });
+  }
+
+  releaseReservation(orderId: string): void {
+    this.database.prepare("DELETE FROM stock_reservations WHERE order_id = ?").run(orderId);
+  }
+
+  fulfillReservation(orderId: string): void {
+    this.transaction(() => {
+      const items = this.database.prepare(`SELECT variant_id, location_id, quantity
+        FROM stock_reservations WHERE order_id = ?`).all(orderId);
+      if (!items.length) throw new InventoryError("No stock reservation exists for this order.", 409);
+      this.releaseReservation(orderId);
+      for (const item of items) {
+        this.stockOut({
+          variantId: String(item.variant_id), locationId: String(item.location_id),
+          quantity: Number(item.quantity), reference: `Order ${orderId}`,
+        });
+      }
+    });
   }
 
   listProducts(search?: string): object[] {
@@ -541,6 +589,7 @@ export class InventoryStore {
     let totalCostMinor = 0;
     let batchAllocations: { batchId: string; lotNumber: string | null; quantity: number; unitCostMinor: number }[] = [];
     this.transaction(() => {
+      this.assertAvailable(input.variantId, locationId, quantity);
       const batches = this.availableBatches(input.variantId, locationId, input.batchId, input.lotNumber);
       const plan = this.planDeduction(batches, quantity);
       this.applyDeduction(plan.allocations);
@@ -581,6 +630,9 @@ export class InventoryStore {
     let batchAllocations: { batchId: string; lotNumber: string | null; quantity: number; unitCostMinor: number }[] = [];
     this.transaction(() => {
       const currentQuantity = this.quantityOnHand(input.variantId, locationId);
+      if (countedQuantity < this.reservedQuantity(input.variantId, locationId)) {
+        throw new InventoryError("Counted stock cannot be less than reserved stock. Resolve the affected orders first.", 409);
+      }
       difference = countedQuantity - currentQuantity;
       if (difference === 0) {
         throw new InventoryError("countedQuantity matches current stock; no adjustment is needed.", 400);
@@ -651,6 +703,7 @@ export class InventoryStore {
     let batchAllocations: { batchId: string; lotNumber: string | null; quantity: number; unitCostMinor: number }[] = [];
 
     this.transaction(() => {
+      this.assertAvailable(input.variantId, sourceLocationId, quantity);
       const batches = this.availableBatches(input.variantId, sourceLocationId);
       const plan = this.planDeduction(batches, quantity);
       this.applyDeduction(plan.allocations);
@@ -726,7 +779,9 @@ export class InventoryStore {
         v.reorder_point AS reorderPoint,
         v.unit_cost_minor AS unitCostMinor,
         v.currency,
-        COALESCE(SUM(b.remaining_quantity), 0) AS quantityOnHand
+        COALESCE(SUM(b.remaining_quantity), 0) AS quantityOnHand,
+        COALESCE((SELECT SUM(r.quantity) FROM stock_reservations r WHERE r.variant_id = v.id AND r.location_id = l.id), 0) AS quantityReserved,
+        COALESCE(SUM(b.remaining_quantity), 0) - COALESCE((SELECT SUM(r.quantity) FROM stock_reservations r WHERE r.variant_id = v.id AND r.location_id = l.id), 0) AS quantityAvailable
       FROM variants v
       JOIN products p ON p.id = v.product_id
       CROSS JOIN locations l
@@ -979,7 +1034,9 @@ export class InventoryStore {
         v.reorder_point AS reorderPoint,
         v.unit_cost_minor AS unitCostMinor,
         v.currency,
-        COALESCE(SUM(b.remaining_quantity), 0) AS quantityOnHand
+        COALESCE(SUM(b.remaining_quantity), 0) AS quantityOnHand,
+        COALESCE((SELECT SUM(r.quantity) FROM stock_reservations r WHERE r.variant_id = v.id AND r.location_id = l.id), 0) AS quantityReserved,
+        COALESCE(SUM(b.remaining_quantity), 0) - COALESCE((SELECT SUM(r.quantity) FROM stock_reservations r WHERE r.variant_id = v.id AND r.location_id = l.id), 0) AS quantityAvailable
       FROM variants v
       JOIN products p ON p.id = v.product_id
       JOIN locations l ON l.id = ?
@@ -999,6 +1056,17 @@ export class InventoryStore {
       FROM batches WHERE variant_id = ? AND location_id = ?
     `).get(variantId, locationId);
     return Number(row?.quantity ?? 0);
+  }
+
+  private reservedQuantity(variantId: string, locationId: string): number {
+    return Number(this.database.prepare(`SELECT COALESCE(SUM(quantity), 0) AS quantity
+      FROM stock_reservations WHERE variant_id = ? AND location_id = ?`).get(variantId, locationId)?.quantity ?? 0);
+  }
+
+  private assertAvailable(variantId: string, locationId: string, quantity: number): void {
+    if (quantity > this.quantityOnHand(variantId, locationId) - this.reservedQuantity(variantId, locationId)) {
+      throw new InventoryError("Insufficient available stock; some stock may be reserved for orders.", 409);
+    }
   }
 
   private availableBatches(
@@ -1137,13 +1205,15 @@ export class InventoryStore {
   }
 
   private transaction<T>(operation: () => T): T {
-    this.database.exec("BEGIN IMMEDIATE");
+    const nested = this.database.isTransaction;
+    const savepoint = `inventory_${randomUUID().replaceAll("-", "")}`;
+    this.database.exec(nested ? `SAVEPOINT ${savepoint}` : "BEGIN IMMEDIATE");
     try {
       const result = operation();
-      this.database.exec("COMMIT");
+      this.database.exec(nested ? `RELEASE ${savepoint}` : "COMMIT");
       return result;
     } catch (error) {
-      this.database.exec("ROLLBACK");
+      this.database.exec(nested ? `ROLLBACK TO ${savepoint}; RELEASE ${savepoint}` : "ROLLBACK");
       throw error;
     }
   }

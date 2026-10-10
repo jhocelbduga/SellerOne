@@ -8,6 +8,7 @@ import { DatabaseSync } from "node:sqlite";
 import nodemailer from "nodemailer";
 import type { Transporter } from "nodemailer";
 import { InventoryError, InventoryStore } from "@sellerone/inventory-service";
+import { CHANNELS, CommerceStore } from "./commerce.js";
 
 const scrypt = promisify(scryptCallback);
 const PORT = Number(process.env.PORT ?? 3100);
@@ -217,7 +218,22 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS expenses_created ON expenses (created_at DESC);
 `);
 
-const inventory = new InventoryStore(DB_PATH);
+const inventory = new InventoryStore(db);
+const commerce = new CommerceStore(db, inventory);
+const publicRequests = new Map<string, { count: number; expiresAt: number }>();
+
+function limitPublicRequests(request: IncomingMessage): void {
+  const now = Date.now();
+  for (const [key, value] of publicRequests) if (value.expiresAt <= now) publicRequests.delete(key);
+  const key = `${request.socket.remoteAddress}:${request.method === "POST" ? "write" : "read"}`;
+  const limit = request.method === "POST" ? 20 : 120;
+  const entry = publicRequests.get(key) ?? { count: 0, expiresAt: now + 60000 };
+  if (entry.count >= limit || (!publicRequests.has(key) && publicRequests.size >= 10000)) {
+    throw new AppError("Too many public requests. Please try again in a minute.", 429);
+  }
+  entry.count += 1;
+  publicRequests.set(key, entry);
+}
 
 function setting(key: string, fallback: string): string {
   return String(db.prepare("SELECT value FROM app_settings WHERE key = ?").get(key)?.value ?? fallback);
@@ -352,76 +368,8 @@ function createMailer(): Transporter | undefined {
 
 const mailer = createMailer();
 
-function orderItems(orderId: string): object[] {
-  return db.prepare(`
-    SELECT id, description, sku, quantity,
-      unit_price_minor AS unitPriceMinor, total_minor AS totalMinor
-    FROM order_items WHERE order_id = ? ORDER BY rowid
-  `).all(orderId);
-}
-
 function insertSessionRevocation(userId: string): void {
   db.prepare("DELETE FROM sessions WHERE user_id = ?").run(userId);
-}
-
-function recordOrder(body: Record<string, unknown>): object {
-  const items = body.items;
-  if (!Array.isArray(items) || items.length === 0 || !items.every(isRecord)) {
-    throw new AppError("An order must contain at least one line item.");
-  }
-  const currency = currencyCode(body.currency ?? DEFAULT_CURRENCY);
-  const normalizedItems = items.map((item) => {
-    const quantity = integer(item.quantity, "Item quantity", 1);
-    const unitPriceMinor = integer(item.unitPriceMinor, "Unit price");
-    return {
-      description: text(item.description, "Item name", 200),
-      sku: optionalText(item.sku, "SKU", 100),
-      quantity,
-      unitPriceMinor,
-      totalMinor: quantity * unitPriceMinor,
-    };
-  });
-  const totalMinor = normalizedItems.reduce((total, item) => total + item.totalMinor, 0);
-  if (!Number.isSafeInteger(totalMinor)) {
-    throw new AppError("Order total is outside the supported range.");
-  }
-  const customerId = optionalText(body.customerId, "Customer ID");
-  const customer = customerId ? db.prepare("SELECT id, name FROM customers WHERE id = ?").get(customerId) : undefined;
-  if (customerId && !customer) {
-    throw new AppError("Customer not found.", 404);
-  }
-  const customerName = customer ? String(customer.name) : text(body.customerName, "Customer name");
-  const id = randomBytes(16).toString("hex");
-  const orderNumber = `SO-${new Date().getFullYear()}-${id.slice(0, 6).toUpperCase()}`;
-  const createdAt = nowIso();
-  const channel = text(body.channel ?? "Manual", "Channel", 50);
-  const status = body.status ?? "pending";
-  if (!["pending", "processing", "shipped", "delivered", "cancelled"].includes(String(status))) {
-    throw new AppError("Invalid order status.");
-  }
-  db.exec("BEGIN IMMEDIATE");
-  try {
-    db.prepare(`
-      INSERT INTO orders (
-        id, order_number, customer_id, customer_name, status, channel,
-        total_minor, currency, notes, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(id, orderNumber, customerId, customerName, String(status), channel, totalMinor, currency,
-      optionalText(body.notes, "Notes"), createdAt, createdAt);
-    const insertItem = db.prepare(`
-      INSERT INTO order_items (id, order_id, description, sku, quantity, unit_price_minor, total_minor)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `);
-    for (const item of normalizedItems) {
-      insertItem.run(randomBytes(16).toString("hex"), id, item.description, item.sku,
-        item.quantity, item.unitPriceMinor, item.totalMinor);
-    }
-    db.exec("COMMIT");
-  } catch (error) {
-    db.exec("ROLLBACK");
-    throw error;
-  }
-  return { ...db.prepare("SELECT * FROM orders WHERE id = ?").get(id), items: orderItems(id) };
 }
 
 function domainSummary(): object {
@@ -440,7 +388,7 @@ function domainSummary(): object {
   `).get(monthStart, monthStart);
   const recentOrders = db.prepare(`
     SELECT id, order_number AS orderNumber, customer_name AS customerName,
-      status, total_minor AS totalMinor, currency, created_at AS createdAt
+      stage AS status, total_minor AS totalMinor, currency, created_at AS createdAt
     FROM orders ORDER BY created_at DESC LIMIT 6
   `).all();
   const lowStock = inventory.listStock({ lowStockOnly: true });
@@ -647,6 +595,30 @@ async function api(
     return;
   }
 
+  if (path[0] === "public") {
+    response.setHeader("cache-control", "no-store");
+    response.setHeader("referrer-policy", "no-referrer");
+    limitPublicRequests(request);
+    if (path[1] === "checkout" && path.length === 3 && method === "GET") {
+      sendJson(response, 200, commerce.checkout(path[2]));
+      return;
+    }
+    if (path[1] === "checkout" && path.length === 3 && method === "POST") {
+      sendJson(response, 201, commerce.submitCheckout(path[2], await readBody(request)));
+      return;
+    }
+    if (path[1] === "tracking" && path.length === 3 && method === "GET") {
+      sendJson(response, 200, commerce.track(path[2]));
+      return;
+    }
+    if (path[1] === "tracking" && path[3] === "payments" && path.length === 4 && method === "POST") {
+      commerce.submitPayment(commerce.trackingOrder(path[2]), await readBody(request), "Customer payment submission");
+      sendJson(response, 201, commerce.track(path[2]));
+      return;
+    }
+    throw new AppError("Public commerce endpoint not found.", 404);
+  }
+
   const user = requireUser(parseUser(request));
   if (path[0] === "me" && method === "GET") {
     sendJson(response, 200, { user });
@@ -803,7 +775,7 @@ async function api(
         items: db.prepare(`
           SELECT c.id, c.name, c.email, c.phone, c.address, c.notes,
             c.created_at AS createdAt, COUNT(o.id) AS orderCount,
-            COALESCE(SUM(CASE WHEN o.status != 'cancelled' THEN o.total_minor ELSE 0 END), 0) AS spentMinor
+            COALESCE(SUM(CASE WHEN o.stage IN ('delivered', 'completed') THEN o.total_minor ELSE 0 END), 0) AS spentMinor
           FROM customers c LEFT JOIN orders o ON o.customer_id = c.id
           GROUP BY c.id ORDER BY c.created_at DESC
         `).all(),
@@ -827,7 +799,7 @@ async function api(
       const customer = db.prepare(`
         SELECT c.id, c.name, c.email, c.phone, c.address, c.notes, c.created_at AS createdAt,
           COUNT(o.id) AS orderCount,
-          COALESCE(SUM(CASE WHEN o.status != 'cancelled' THEN o.total_minor ELSE 0 END), 0) AS spentMinor
+          COALESCE(SUM(CASE WHEN o.stage IN ('delivered', 'completed') THEN o.total_minor ELSE 0 END), 0) AS spentMinor
         FROM customers c LEFT JOIN orders o ON o.customer_id = c.id
         WHERE c.id = ? GROUP BY c.id
       `).get(path[1]);
@@ -835,7 +807,7 @@ async function api(
         throw new AppError("Customer not found.", 404);
       }
       const orders = db.prepare(`
-        SELECT id, order_number AS orderNumber, status,
+        SELECT id, order_number AS orderNumber, stage AS status,
           total_minor AS totalMinor, currency, created_at AS createdAt
         FROM orders WHERE customer_id = ? ORDER BY created_at DESC
       `).all(path[1]);
@@ -872,48 +844,53 @@ async function api(
     }
   }
 
+  if (path[0] === "commerce" && path[1] === "channels" && path.length === 2 && method === "GET") {
+    sendJson(response, 200, { items: CHANNELS.map((name) => ({ name, connection: name === "Manual" || name === "Shareable Order Link" ? "local" : "manual / import; live API not connected" })) });
+    return;
+  }
+  if (path[0] === "checkout-links") {
+    requireAdmin(user);
+    if (path.length === 1 && method === "GET") { sendJson(response, 200, { items: commerce.links() }); return; }
+    if (path.length === 1 && method === "POST") { sendJson(response, 201, commerce.createLink(await readBody(request))); return; }
+    if (path.length === 2 && method === "DELETE") { commerce.disableLink(path[1]); sendJson(response, 200, { ok: true }); return; }
+  }
   if (path[0] === "orders") {
     if (path.length === 1 && method === "GET") {
-      sendJson(response, 200, {
-        items: db.prepare(`
-          SELECT id, order_number AS orderNumber, customer_id AS customerId,
-            customer_name AS customerName, status, channel, total_minor AS totalMinor,
-            currency, created_at AS createdAt
-          FROM orders ORDER BY created_at DESC LIMIT 500
-        `).all(),
-      });
+      sendJson(response, 200, commerce.list({
+        page: Number(url.searchParams.get("page") ?? 1), search: url.searchParams.get("search")?.trim() || undefined,
+        stage: url.searchParams.get("stage") || undefined, channel: url.searchParams.get("channel") || undefined,
+        payment: url.searchParams.get("payment") || undefined,
+      }));
       return;
     }
     if (path.length === 1 && method === "POST") {
-      sendJson(response, 201, recordOrder(await readBody(request)));
+      sendJson(response, 201, commerce.create(await readBody(request), user.name));
+      return;
+    }
+    if (path[1] === "import" && path.length === 2 && method === "POST") {
+      requireAdmin(user);
+      sendJson(response, 200, commerce.create(await readBody(request), user.name, true));
       return;
     }
     if (path.length === 2 && method === "GET") {
-      const order = db.prepare(`
-        SELECT id, order_number AS orderNumber, customer_id AS customerId,
-          customer_name AS customerName, status, channel, total_minor AS totalMinor,
-          currency, notes, created_at AS createdAt, updated_at AS updatedAt
-        FROM orders WHERE id = ?
-      `).get(path[1]);
-      if (!order) {
-        throw new AppError("Order not found.", 404);
-      }
-      sendJson(response, 200, { ...order, items: orderItems(path[1]) });
+      sendJson(response, 200, commerce.get(path[1]));
       return;
     }
     if (path.length === 2 && method === "PATCH") {
+      sendJson(response, 200, commerce.transition(path[1], await readBody(request), user));
+      return;
+    }
+    if (path.length === 3 && method === "POST") {
       const body = await readBody(request);
-      const allowed = ["pending", "processing", "shipped", "delivered", "cancelled"];
-      if (typeof body.status !== "string" || !allowed.includes(body.status)) {
-        throw new AppError("Enter a valid order status.");
-      }
-      const result = db.prepare("UPDATE orders SET status = ?, updated_at = ? WHERE id = ?")
-        .run(body.status, nowIso(), path[1]);
-      if (Number(result.changes) !== 1) {
-        throw new AppError("Order not found.", 404);
-      }
-      const order = db.prepare("SELECT * FROM orders WHERE id = ?").get(path[1]);
-      sendJson(response, 200, { ...order, items: orderItems(path[1]) });
+      const result = path[2] === "payments" ? commerce.submitPayment(path[1], body, user.name)
+        : path[2] === "verify-payment" ? commerce.reviewPayment(path[1], body, user, true)
+        : path[2] === "reject-payment" ? commerce.reviewPayment(path[1], body, user, false)
+        : path[2] === "shipping" ? commerce.updateShipping(path[1], body, user)
+        : path[2] === "refund" ? commerce.refund(path[1], body, user)
+        : path[2] === "communications" ? commerce.communicate(path[1], body, user)
+        : undefined;
+      if (!result) throw new AppError("Order action not found.", 404);
+      sendJson(response, 200, result);
       return;
     }
   }
@@ -1016,8 +993,8 @@ async function api(
       FROM expenses WHERE currency = ? GROUP BY category ORDER BY amountMinor DESC
     `).all(currency);
     const orders = db.prepare(`
-      SELECT status, currency, COUNT(*) AS count, SUM(total_minor) AS amountMinor
-      FROM orders WHERE currency = ? GROUP BY status ORDER BY status
+      SELECT stage AS status, currency, COUNT(*) AS count, SUM(total_minor) AS amountMinor
+      FROM orders WHERE currency = ? GROUP BY stage ORDER BY stage
     `).all(currency);
     sendJson(response, 200, { currency, sales, expenses, orders });
     return;
@@ -1114,6 +1091,7 @@ function serveFile(request: IncomingMessage, response: ServerResponse, pathname:
   response.writeHead(200, {
     "content-type": MIME_TYPES[extname(target)] ?? "application/octet-stream",
     "cache-control": target.endsWith("index.html") ? "no-cache" : "public, max-age=31536000, immutable",
+    "referrer-policy": "no-referrer",
   });
   createReadStream(target).pipe(response);
 }

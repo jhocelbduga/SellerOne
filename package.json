@@ -9,7 +9,7 @@
   "scripts": {
     "build": "npm run build --workspaces --if-present",
     "typecheck": "npm run typecheck --workspaces --if-present",
-    "test": "npm run test --workspace @sellerone/inventory-service",
+    "test": "npm run test --workspace @sellerone/inventory-service && npm run test --workspace @sellerone/platform-service",
     "dev:platform": "npm run dev --workspace @sellerone/platform-service",
     "dev:web": "npm run dev --workspace @sellerone/web",
     "start:platform": "npm run start --workspace @sellerone/platform-service",

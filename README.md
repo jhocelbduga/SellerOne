@@ -63,9 +63,13 @@ Simplify inventory tracking and stock control with real-time visibility.
 
 ### 2. Social Commerce Order Processing
 
-Manage orders directly from social media channels and online selling platforms.
+Manage channel-attributed orders and shareable checkout submissions through a
+unified workflow. Live social-platform API connections are not yet configured.
 
 **Supported Channels**
+These channels are supported for manual attribution and normalized imports,
+not automatic capture from their native APIs:
+
 - TikTok Shop
 - Facebook Marketplace
 - Facebook Page
@@ -274,7 +278,9 @@ the requested login, registration, dashboard, product, inventory, order,
 customer, sales, expense, accounting, report, settings, and user-management
 screens. Inventory uses persistent SQLite storage, FIFO valuation, and prevents
 negative stock. Orders and sales are recorded independently; creating an order
-does not reserve or deduct inventory automatically.
+now reserves inventory after payment verification and deducts it at dispatch.
+Live channel, payment-gateway, messaging-provider, and carrier integrations
+remain outside the local implementation.
 
 ### Requirements
 
@@ -313,6 +319,9 @@ The login form supports browser/password-manager autofill using the work email
 as the username and the saved current password. Suggestions depend on saved
 credentials and browser settings; SellerOne does not store passwords in browser
 storage.
+The ellipsis beside the sidebar account name opens account options. Owners and
+admins can open workspace settings; all users can sign out. Click outside the
+panel or press Escape to close it. Sign-out errors are shown without redirecting.
 
 The platform and inventory data share `DATABASE_PATH` (default
 `.data/sellerone.sqlite`). Set `DATABASE_PATH` to a persistent writable path for
@@ -421,7 +430,137 @@ Receive stock:
 }
 ```
 
-Run the inventory service tests with `npm test`.
+Run inventory and platform commerce integration tests with `npm test`.
+
+### Social commerce order processing
+
+Open **Orders** for a unified inbox with channel, workflow-stage, payment, and
+customer/order search filters, applied server-side across all orders with
+50-row pagination (no hidden newest-order cutoff). Capture multiple catalog variants with their
+selling prices (not inventory costs), currency, customer, fulfillment location,
+external channel order ID, and delivery information. New customers are added to
+the customer book. Each order has a printable, non-tax-certified invoice,
+private tracking link, payment references, shipment information, communication
+log, and an ordered audit timeline.
+
+#### Order lifecycle and inventory accuracy
+
+1. **Received**: awaiting payment; no stock is reserved yet.
+2. Submit a full-amount payment reference. The seller must independently check
+   the funds. A reference alone never marks an order paid.
+3. An **owner/admin** verifies payment and reserves stock in one SQLite
+   transaction. Insufficient stock rolls back both verification and all line
+   reservations. Staff cannot approve, reject, or record refunds.
+4. **Packing**: reserved stock remains physically on hand.
+5. **Shipped**: enter carrier/tracking number; phone and delivery address are
+   required. All reserved items are deducted using FIFO in the same transaction
+   as the stage change. Retry does not double-deduct stock.
+6. **Delivered**: seller records delivery confirmation manually.
+7. **Completed**: creates one linked sales entry; retries do not duplicate it.
+
+Inventory shows on-hand, reserved, and available quantities per UOM/location.
+Manual stock-outs, transfers, and physical-count adjustments cannot consume
+reserved stock. There is no unit conversion. Pre-dispatch cancellation releases
+reservations; verified payments then show **Refund due**. Refund money outside
+SellerOne first, then record the refund reference. Dispatched orders cannot be
+cancelled through this workflow; returns/exchanges and partial refunds are not
+implemented. This release uses full-payment-before-dispatch; COD, installments,
+discounts, tax computation, and shipping-fee calculation are not implemented.
+Orders with different currencies cannot mix items.
+
+The platform shares one SQLite connection with inventory so order, payment,
+reservation, stock movement, and linked sale changes commit or roll back
+together. Existing orders migrate automatically: pending/processing become
+received (they have no verified reservation), while shipped/delivered/cancelled
+retain their stage. Historical shipped orders are not retrospectively deducted.
+Legacy items are matched by SKU at verification; unmatched items must be
+cancelled and recreated. New orders snapshot UOM and reject verification if the
+catalog UOM changed before stock was received. Dashboard, customer order history,
+and reports reflect the new stages. Customer lifetime order spending includes
+delivered/completed orders rather than unconfirmed submissions.
+
+#### Checkout app links and customer tracking
+
+Owners/admins choose **Create app link**, set selling prices, channel, location,
+and a validity of 1-90 days. Copy the generated `/checkout/<random-token>` URL
+into a social post, bio, chat, or message. Each link is a reusable offer/cart;
+customers choose quantities, enter contact/delivery details, and submit without
+an account. Checkout prices are enforced on the server. Invalid, inactive,
+expired, unoffered, and insufficient-stock selections are rejected. A checkout
+does not guarantee inventory until payment is verified.
+
+The confirmation redirects to `/track/<random-token>`. Customers can refresh
+status, see shipment details and seller messages, and submit a payment reference.
+Tracking does not disclose customer contact/address, internal notes, payment
+references, reviewers, or staff identities. Tracking URLs are private bearer
+capabilities: send only to the intended customer, never publish them. Disabling
+a checkout link blocks new submissions but does not break existing tracking.
+Public API responses are non-cacheable, pages do not send referrer URLs, and
+public requests have basic per-network-address limits (120 reads / 20 writes
+per minute per process). Configure proper HTTPS hosting and edge rate limiting
+before exposing this application publicly; localhost links work only locally.
+
+There is no live TikTok/Meta capture, online payment collection, automated
+bank verification, automatic email/social messaging, or carrier callback.
+Use **Customer communication** to prepare a message, send it manually through
+your channel, and log it as sent; only sent messages appear on customer tracking.
+Never mark a draft sent unless it was actually delivered through your channel.
+
+#### Authenticated import and commerce APIs
+
+All private endpoints require the existing SellerOne session cookie; owner/admin
+permissions additionally apply to imports, checkout-link management, and payment
+review/refund. Browser writes must be same-origin. Routes below have `/api`
+prefixes. New order creation accepts optional `idempotencyKey`; import uses
+unique `(channel, externalId)` and returns the original order on duplicate
+delivery. Public checkout requires `idempotencyKey`; reuse it to safely retry
+the same submission. Do not reuse a key for a different purchase.
+
+| Method | Endpoint | Purpose |
+| --- | --- | --- |
+| `GET`, `POST` | `/orders` | Unified inbox / create a received order |
+| `POST` | `/orders/import` | Import one normalized channel order with externalId |
+| `GET` | `/orders/:id` | Invoice, items, payments, shipping, timeline, communication |
+| `PATCH` | `/orders/:id` | Advance `{stage}` through allowed transitions |
+| `POST` | `/orders/:id/payments` | Submit method, reference, amountMinor, currency |
+| `POST` | `/orders/:id/verify-payment` | Verify `{paymentId, note?}` and reserve inventory |
+| `POST` | `/orders/:id/reject-payment` | Reject `{paymentId, note}` |
+| `POST` | `/orders/:id/shipping` | Set `{customerPhone, shippingAddress}` before dispatch |
+| `POST` | `/orders/:id/refund` | Record `{note}` for manual refund on cancelled order |
+| `POST` | `/orders/:id/communications` | Log `{message, status: "prepared" \| "sent"}` |
+| `GET` | `/commerce/channels` | Channel names and honest connection status |
+| `GET`, `POST` | `/checkout-links` | List / create reusable checkout app links |
+| `DELETE` | `/checkout-links/:id` | Disable future checkout submissions |
+| `GET`, `POST` | `/public/checkout/:token` | Read offer / submit customer checkout |
+| `GET` | `/public/tracking/:token` | Privacy-restricted order tracking |
+| `POST` | `/public/tracking/:token/payments` | Submit a reference, never verify a payment |
+
+Example normalized import:
+
+```json
+{
+  "channel": "TikTok Shop",
+  "externalId": "CHANNEL-ORDER-123",
+  "customerName": "Customer Name",
+  "customerEmail": "customer@example.com",
+  "customerPhone": "09123456789",
+  "shippingAddress": "Delivery address",
+  "locationId": "main",
+  "currency": "PHP",
+  "items": [
+    { "sku": "COFFEE-250", "quantity": 2, "unitPriceMinor": 15000 }
+  ]
+}
+```
+
+Use `variantId` instead of `sku` when known. An adapter with approved provider
+API access must translate native payloads to this format before importing.
+Raw provider webhooks are not accepted and no connectors are simulated.
+Dispatch requires `{ "stage": "shipped", "carrier": "...", "trackingNumber": "..." }`.
+Legacy free-form `{status}` updates are intentionally rejected to prevent
+bypassing payment and inventory guards.
+The inbox GET supports `page`, `search`, `stage`, `channel`, and `payment` query
+parameters and returns `{items, total, page, pageSize}`.
 
 ### Run with Docker Compose
 

@@ -12,6 +12,8 @@ import {
   BrowserRouter, Link, Navigate, Outlet, Route, Routes, useLocation, useNavigate, useParams,
 } from "react-router-dom";
 import "./styles.css";
+import { api, money, dateLabel, useLoad } from "./api";
+import { CommerceOrders, CommerceOrderDetails, CheckoutPage, TrackingPage } from "./commerce";
 
 type Role = "owner" | "admin" | "staff";
 interface User {
@@ -63,30 +65,6 @@ const SessionContext = createContext<SessionState>({
   refresh: async () => undefined,
 });
 
-async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
-  const response = await fetch(`/api${path}`, {
-    ...options,
-    headers: {
-      ...(options.body ? { "content-type": "application/json" } : {}),
-      ...options.headers,
-    },
-  });
-  const payload = await response.json().catch(() => ({})) as Record<string, unknown>;
-  if (!response.ok) {
-    throw new Error(typeof payload.error === "string" ? payload.error : `Request failed (${response.status}).`);
-  }
-  return payload as T;
-}
-
-function money(minor: unknown, currency = "PHP"): string {
-  return new Intl.NumberFormat("en-PH", { style: "currency", currency }).format(Number(minor ?? 0) / 100);
-}
-
-function dateLabel(value: unknown): string {
-  if (!value) return "—";
-  return new Intl.DateTimeFormat("en-PH", { dateStyle: "medium" }).format(new Date(String(value)));
-}
-
 function stockQuantitySummary(rows: Record<string, unknown>[]): string {
   const totals = new Map<string, number>();
   for (const row of rows) {
@@ -133,6 +111,8 @@ function SessionProvider(): React.JSX.Element {
         <Route path="/register" element={<AuthPage mode="register" />} />
         <Route path="/forgot-password" element={<AuthPage mode="forgot" />} />
         <Route path="/reset-password" element={<AuthPage mode="reset" />} />
+        <Route path="/checkout/:token" element={<CheckoutPage />} />
+        <Route path="/track/:token" element={<TrackingPage />} />
         <Route element={<ProtectedLayout />}>
           <Route index element={<DashboardPage />} />
           <Route path="dashboard" element={<DashboardPage />} />
@@ -140,8 +120,8 @@ function SessionProvider(): React.JSX.Element {
           <Route path="products/new" element={<ProductFormPage />} />
           <Route path="products/:id/edit" element={<ProductFormPage />} />
           <Route path="inventory" element={<InventoryPage />} />
-          <Route path="orders" element={<OrdersPage />} />
-          <Route path="orders/:id" element={<OrderDetailsPage />} />
+          <Route path="orders" element={<CommerceOrders role={user?.role ?? "staff"} />} />
+          <Route path="orders/:id" element={<CommerceOrderDetails role={user?.role ?? "staff"} />} />
           <Route path="customers" element={<CustomersPage />} />
           <Route path="customers/:id" element={<CustomerProfilePage />} />
           <Route path="sales" element={<SalesPage />} />
@@ -174,6 +154,56 @@ const primaryNav = [
     { to: "/reports", label: "Reports", icon: ChartNoAxesCombined },
   ] },
 ];
+
+function AccountOptions({ user, onNavigate }: { user: User; onNavigate: () => void }): React.JSX.Element {
+  const [open, setOpen] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const container = React.useRef<HTMLDivElement>(null);
+  const trigger = React.useRef<HTMLButtonElement>(null);
+  const panelId = React.useId();
+  const location = useLocation();
+  useEffect(() => { setOpen(false); }, [location.pathname]);
+  useEffect(() => {
+    if (!open) return;
+    const dismiss = (event: PointerEvent | FocusEvent) => {
+      if (event.target instanceof Node && !container.current?.contains(event.target)) setOpen(false);
+    };
+    const escape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setOpen(false);
+        trigger.current?.focus();
+      }
+    };
+    document.addEventListener("pointerdown", dismiss);
+    document.addEventListener("focusin", dismiss);
+    document.addEventListener("keydown", escape);
+    return () => {
+      document.removeEventListener("pointerdown", dismiss);
+      document.removeEventListener("focusin", dismiss);
+      document.removeEventListener("keydown", escape);
+    };
+  }, [open]);
+  const signOut = async () => {
+    setBusy(true); setError("");
+    try {
+      await api("/auth/logout", { method: "POST" });
+      window.location.assign("/login");
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Could not sign out. Please try again.");
+      setBusy(false);
+    }
+  };
+  return <div className="account-options" ref={container}>
+    <button ref={trigger} className="icon-button profile-more" type="button" aria-label="Account options" aria-expanded={open} aria-controls={panelId} onClick={() => setOpen((value) => !value)}><MoreHorizontal size={19} /></button>
+    {open && <div className="account-panel" id={panelId} role="region" aria-label="Account options">
+      <strong>{user.name}</strong><small>{user.email}</small>
+      {user.role !== "staff" && <Link className="account-action" to="/settings" onClick={() => { setOpen(false); onNavigate(); }}><Settings size={16} /> Workspace settings</Link>}
+      <button className="account-action" type="button" disabled={busy} onClick={() => void signOut()}><LogOut size={16} /> {busy ? "Signing out..." : "Sign out"}</button>
+      {error && <div className="error-box" role="alert">{error}</div>}
+    </div>}
+  </div>;
+}
 
 function ProtectedLayout(): React.JSX.Element {
   const { user, needsSetup } = useContext(SessionContext);
@@ -219,7 +249,7 @@ function ProtectedLayout(): React.JSX.Element {
           <div className="profile-mini">
             <span className="avatar avatar-sage">{initials(user.name)}</span>
             <span className="profile-meta"><strong>{user.name}</strong><small>{user.role === "owner" ? "Workspace owner" : user.role}</small></span>
-            <button className="icon-button profile-more" type="button" aria-label="Account options"><MoreHorizontal size={19} /></button>
+            <AccountOptions user={user} onNavigate={() => setMobileNavOpen(false)} />
           </div>
         </div>
       </aside>
@@ -376,33 +406,12 @@ function DataTable({ columns, rows, empty, rowKey }: { columns: { label: string;
 }
 
 function StatusPill({ status }: { status: string }): React.JSX.Element {
-  const normalized = status.toLowerCase().replace(/\s+/g, "-");
-  return <span className={`status-pill status-${normalized}`}><i />{status.replace(/-/g, " ")}</span>;
+  const normalized = status.toLowerCase().replace(/[_\s]+/g, "-");
+  return <span className={`status-pill status-${normalized}`}><i />{status.replace(/[-_]/g, " ")}</span>;
 }
 
 function EmptyState({ icon, title, description, action }: { icon: React.ReactNode; title: string; description: string; action?: React.ReactNode }): React.JSX.Element {
   return <div className="empty-state"><span className="empty-icon">{icon}</span><h3>{title}</h3><p>{description}</p>{action}</div>;
-}
-
-function useLoad<T>(path: string): { data: T | null; error: string; loading: boolean; reload: () => void } {
-  const [data, setData] = useState<T | null>(null);
-  const [error, setError] = useState("");
-  const [loading, setLoading] = useState(true);
-  const [version, setVersion] = useState(0);
-  useEffect(() => {
-    if (!path) {
-      setLoading(false);
-      setData(null);
-      return;
-    }
-    let alive = true;
-    setLoading(true);
-    api<T>(path).then((result) => { if (alive) { setData(result); setError(""); } })
-      .catch((caught: unknown) => { if (alive) setError(caught instanceof Error ? caught.message : "Could not load this page."); })
-      .finally(() => { if (alive) setLoading(false); });
-    return () => { alive = false; };
-  }, [path, version]);
-  return { data, error, loading, reload: () => setVersion((value) => value + 1) };
 }
 
 function PageError({ message }: { message: string }): React.JSX.Element {
@@ -650,6 +659,7 @@ function InventoryPage(): React.JSX.Element {
         { label: "PRODUCT / VARIANT", render: (row) => <span className="product-cell"><span className="product-thumb"><Package size={16} /></span><span><strong>{String(row.productName)} · {String(row.variantName)}</strong>{typeof row.variantDescription === "string" && row.variantDescription.length > 0 && <small>{row.variantDescription}</small>}<small className="mono">{String(row.sku)}</small></span></span> },
         { label: "LOCATION", render: (row) => String(row.locationName) },
         { label: "ON HAND", render: (row) => <strong>{String(row.quantityOnHand)} <small className="muted">{String(row.uom)}</small></strong> },
+        { label: "RESERVED / AVAILABLE", render: (row) => `${row.quantityReserved} / ${row.quantityAvailable} ${row.uom}` },
         { label: "REORDER AT", render: (row) => `${row.reorderPoint} ${row.uom}` },
         { label: "STATUS", render: (row) => Number(row.quantityOnHand) === 0 ? <StatusPill status="Out of stock" /> : Number(row.quantityOnHand) <= Number(row.reorderPoint) ? <StatusPill status="Low stock" /> : <StatusPill status="In stock" /> },
         { label: "VALUE", className: "align-right", render: (row) => money(Number(row.quantityOnHand) * Number(row.unitCostMinor), String(row.currency)) },
@@ -733,80 +743,6 @@ function Modal({ title, children, onClose }: { title: string; children: React.Re
     window.addEventListener("keydown", handler); return () => window.removeEventListener("keydown", handler);
   }, [onClose]);
   return <div className="modal-scrim" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><div className="modal-card" role="dialog" aria-modal="true" aria-label={title}><div className="modal-heading"><div><span className="page-eyebrow">INVENTORY</span><h2>{title}</h2></div><IconButton label="Close" onClick={onClose}><X size={18} /></IconButton></div>{children}</div></div>;
-}
-
-function OrdersPage(): React.JSX.Element {
-  const { data, loading, error, reload } = useLoad<{ items: Record<string, unknown>[] }>("/orders");
-  const customers = useLoad<{ items: Customer[] }>("/customers");
-  const products = useLoad<{ items: Product[] }>("/products");
-  const [filter, setFilter] = useState("all");
-  const [search, setSearch] = useState("");
-  const [modal, setModal] = useState(false);
-  const [errorMessage, setErrorMessage] = useState("");
-  const rows = (data?.items ?? []).filter((row) => (filter === "all" || row.status === filter) && `${row.orderNumber} ${row.customerName}`.toLowerCase().includes(search.toLowerCase()));
-  const variants = products.data?.items.flatMap((product) => product.variants.map((variant) => ({ ...variant, productName: product.name }))) ?? [];
-  const create = async (event: React.FormEvent<HTMLFormElement>) => {
-    event.preventDefault(); setErrorMessage("");
-    const fields = new FormData(event.currentTarget);
-    const customerId = String(fields.get("customerId") ?? "");
-    const variant = variants.find((item) => item.id === fields.get("variantId"));
-    if (!variant) { setErrorMessage("Choose a product before saving this order."); return; }
-    const quantity = Number(fields.get("quantity"));
-    try {
-      await api("/orders", { method: "POST", body: JSON.stringify({
-        customerId: customerId || undefined,
-        customerName: customerId ? undefined : fields.get("customerName"),
-        channel: fields.get("channel"),
-        notes: fields.get("notes"),
-        currency: variant.currency,
-        items: [{ description: `${variant.productName} · ${variant.name}`, sku: variant.sku, quantity, unitPriceMinor: Math.round(Number(fields.get("unitPrice")) * 100) }],
-      }) });
-      setModal(false); reload();
-    } catch (caught) { setErrorMessage(caught instanceof Error ? caught.message : "Could not create this order."); }
-  };
-  return <>
-    <PageHeading eyebrow="FULFILLMENT" title="Orders" description="Every order, from first hello to out the door." action={<Button onClick={() => setModal(true)}><Plus size={17} /> New order</Button>} />
-    {error && <PageError message={error} />}{errorMessage && <PageError message={errorMessage} />}
-    <div className="stat-grid stat-grid-three"><StatCard label="All orders" value={String(data?.items.length ?? 0)} icon={<ShoppingBag size={17} />} /><StatCard label="To fulfill" value={String((data?.items ?? []).filter((row) => ["pending", "processing"].includes(String(row.status))).length)} icon={<ClipboardList size={17} />} tone="blue" /><StatCard label="On the way" value={String((data?.items ?? []).filter((row) => row.status === "shipped").length)} icon={<ArrowUpRight size={17} />} tone="sand" /></div>
-    <section className="panel list-panel"><div className="list-toolbar"><div className="tabs compact-tabs">{["all", "pending", "processing", "shipped", "delivered", "cancelled"].map((item) => <button className={filter === item ? "tab active" : "tab"} onClick={() => setFilter(item)} key={item}>{item[0].toUpperCase() + item.slice(1)}</button>)}</div><SearchField value={search} onChange={setSearch} placeholder="Find an order…" /></div>{loading ? <div className="table-skeleton" /> : <DataTable rowKey="id" rows={rows} empty="Your next order is just around the corner." columns={[
-      { label: "ORDER", render: (row) => <Link className="table-primary" to={`/orders/${row.id}`}>{String(row.orderNumber)}</Link> },
-      { label: "CUSTOMER", render: (row) => String(row.customerName) },
-      { label: "CHANNEL", render: (row) => <span className="channel-tag">{String(row.channel)}</span> },
-      { label: "STATUS", render: (row) => <StatusPill status={String(row.status)} /> },
-      { label: "DATE", render: (row) => dateLabel(row.createdAt) },
-      { label: "TOTAL", className: "align-right", render: (row) => <strong>{money(row.totalMinor, String(row.currency))}</strong> },
-      { label: "", render: (row) => <Link className="row-action" to={`/orders/${row.id}`}>Details <ChevronRight size={14} /></Link> },
-    ]} />}</section>
-    {modal && <Modal title="Create a new order" onClose={() => setModal(false)}><form className="modal-form" onSubmit={(event) => void create(event)}><label className="field-label">Customer<select name="customerId"><option value="">New customer / walk-in</option>{customers.data?.items.map((customer) => <option key={customer.id} value={customer.id}>{customer.name}</option>)}</select></label><label className="field-label">Customer name<input name="customerName" placeholder="Needed for a walk-in customer" /></label><label className="field-label">Product<select name="variantId" required><option value="">Choose a product</option>{variants.map((variant) => <option key={variant.id} value={variant.id}>{variant.productName} · {variant.name}</option>)}</select></label><div className="form-grid"><label className="field-label">Quantity<input type="number" name="quantity" min="1" value="1" required /></label><label className="field-label">Unit price<input type="number" name="unitPrice" min="0" step="0.01" required /></label></div><label className="field-label">Channel<select name="channel"><option>Manual</option><option>Facebook</option><option>Instagram</option><option>TikTok Shop</option><option>Messenger</option></select></label><label className="field-label">Notes<input name="notes" maxLength={500} /></label><p className="form-footnote">This creates an order record. Inventory is updated separately from the Inventory page.</p><div className="modal-actions"><Button type="button" variant="secondary" onClick={() => setModal(false)}>Cancel</Button><Button type="submit">Create order <ChevronRight size={15} /></Button></div></form></Modal>}
-  </>;
-}
-
-function OrderDetailsPage(): React.JSX.Element {
-  const { id } = useParams();
-  const { data, error, loading, reload } = useLoad<Record<string, unknown>>(`/orders/${id}`);
-  const [busy, setBusy] = useState(false);
-  const [notice, setNotice] = useState("");
-  const updateStatus = async (status: string) => {
-    setBusy(true); setNotice("");
-    try { await api(`/orders/${id}`, { method: "PATCH", body: JSON.stringify({ status }) }); setNotice("Order status updated."); reload(); }
-    catch (caught) { setNotice(caught instanceof Error ? caught.message : "Could not update this order."); }
-    finally { setBusy(false); }
-  };
-  if (loading) return <LoadingGrid />;
-  if (error || !data) return <PageError message={error || "Order not found."} />;
-  const items = data.items as Record<string, unknown>[];
-  return <>
-    <Link className="back-link" to="/orders"><ChevronLeft size={15} /> Back to orders</Link>
-    <PageHeading eyebrow={`ORDER / ${String(data.orderNumber)}`} title="Order details" description={`Placed ${dateLabel(data.createdAt)} · ${String(data.channel)}`} action={<div className="button-group"><select className="status-select" value={String(data.status)} disabled={busy} onChange={(event) => void updateStatus(event.target.value)}><option value="pending">Pending</option><option value="processing">Processing</option><option value="shipped">Shipped</option><option value="delivered">Delivered</option><option value="cancelled">Cancelled</option></select><Button variant="secondary" onClick={() => window.print()}><FileText size={16} /> Print</Button></div>} />
-    {notice && <div className="success-box">{notice}</div>}
-    <div className="detail-grid"><section className="panel"><SectionHeading title="Items in this order" subtitle={`${items.length} line item${items.length === 1 ? "" : "s"}`} /><DataTable rowKey="id" rows={items} empty="No items in this order." columns={[
-      { label: "ITEM", render: (row) => <span><strong>{String(row.description)}</strong><small className="mono">{String(row.sku ?? "")}</small></span> },
-      { label: "QTY", render: (row) => String(row.quantity) },
-      { label: "UNIT PRICE", className: "align-right", render: (row) => money(row.unitPriceMinor, String(data.currency)) },
-      { label: "TOTAL", className: "align-right", render: (row) => <strong>{money(row.totalMinor, String(data.currency))}</strong> },
-    ]} /><div className="order-total"><span>Order total</span><strong>{money(data.totalMinor, String(data.currency))}</strong></div></section>
-    <div className="detail-side"><section className="panel"><SectionHeading title="Order status" /><StatusPill status={String(data.status)} /><div className="detail-meta"><span>Order number</span><strong className="mono">{String(data.orderNumber)}</strong><span>Channel</span><strong>{String(data.channel)}</strong><span>Created</span><strong>{dateLabel(data.createdAt)}</strong><span>Last updated</span><strong>{dateLabel(data.updatedAt)}</strong></div></section><section className="panel"><SectionHeading title="Customer" /><strong className="customer-detail-name">{String(data.customerName)}</strong>{data.customerId ? <Link className="inline-link" to={`/customers/${data.customerId}`}>View customer profile <ChevronRight size={14} /></Link> : <span className="muted small-copy">Walk-in customer</span>}</section>{Boolean(data.notes) && <section className="panel"><SectionHeading title="Order notes" /><p className="detail-notes">{String(data.notes)}</p></section>}</div></div>
-  </>;
 }
 
 function CustomersPage(): React.JSX.Element {

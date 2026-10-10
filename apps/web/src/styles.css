@@ -64,6 +64,31 @@ button { color: inherit; }
 .avatar-top { width: 29px; height: 29px; background: #e6eadf; color: #607658; }
 .avatar-customer { width: 33px; height: 33px; background: #f0eadd; color: #9b805c; }
 .profile-more { margin-left: auto; }
+.account-options { position: relative; margin-left: auto; }
+.account-panel { position: absolute; bottom: calc(100% + 12px); right: 0; width: 200px; padding: 12px; border: 1px solid #edf0eb; border-radius: 12px; background: #fff; box-shadow: 0 8px 28px rgba(28,47,37,.14); z-index: 1; }
+.account-panel > strong, .account-panel > small { display: block; overflow-wrap: anywhere; }
+.account-panel > small { margin: 4px 0 10px; color: #929b95; font-size: 11px; }
+.account-action { display: flex; align-items: center; gap: 8px; width: 100%; padding: 10px 8px; border: 0; border-radius: 6px; background: transparent; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.account-action:hover, .account-action:focus-visible { background: #edf0eb; }
+.account-action:disabled { cursor: wait; opacity: .6; }
+.commerce-panel { padding: 22px; margin: 18px 0; min-width: 0; }
+.commerce-panel h2 { margin: 0 0 16px; font-size: 18px; overflow-wrap: anywhere; }
+.commerce-panel p { line-height: 1.6; overflow-wrap: anywhere; }
+.commerce-table-wrap { overflow-x: auto; }
+.commerce-table { width: 100%; border-collapse: collapse; }
+.commerce-table th, .commerce-table td { padding: 12px; border-bottom: 1px solid #edf0eb; text-align: left; }
+.commerce-table td { overflow-wrap: anywhere; min-width: 100px; }
+.commerce-table small { display: block; margin-top: 4px; }
+.commerce-cart-line, .commerce-link-card { padding: 14px; border: 1px solid #edf0eb; border-radius: 10px; margin: 12px 0; }
+.commerce-share { display: grid; gap: 10px; margin: 12px 0; }
+.commerce-share input { width: 100%; min-width: 0; }
+.commerce-timeline { padding-left: 22px; }
+.commerce-timeline li { padding: 10px 0; }
+.commerce-timeline p { margin: 6px 0; }
+.commerce-example { overflow-x: auto; padding: 14px; background: #edf0eb; border-radius: 8px; }
+.commerce-public { max-width: 880px; margin: 0 auto; padding: 24px 16px; }
+.commerce-filters { margin-bottom: 20px; }
+@media print { .commerce-no-print { display: none !important; } }
 .main-column { min-height: 100vh; margin-left: 246px; display: flex; flex-direction: column; }
 .topbar { position: sticky; top: 0; z-index: 20; height: 62px; flex: none; display: flex; align-items: center; justify-content: space-between; padding: 0 40px; border-bottom: 1px solid #ebeeea; background: rgba(255,255,255,.94); backdrop-filter: blur(14px); }
 .breadcrumbs, .topbar-actions { display: flex; align-items: center; }
@@ -140,7 +165,7 @@ button { color: inherit; }
 .table-number { font-weight: 700; color: #46584d; }.table-number small { display: inline !important; margin-left: 3px !important; }
 .status-pill { display: inline-flex; align-items: center; gap: 5px; min-height: 22px; padding: 0 8px; border-radius: 20px; background: #f1f4ee; color: #66816c; font-size: 9px; font-weight: 600; text-transform: capitalize; white-space: nowrap; }
 .status-pill i { width: 5px; height: 5px; flex: none; border-radius: 50%; background: currentColor; }
-.status-pending, .status-low-stock { background: #f7f1e7; color: #a1844f; }.status-processing, .status-shipped { background: #edf2f5; color: #66869b; }.status-delivered, .status-in-stock, .status-active { background: #edf4ec; color: #618064; }.status-cancelled, .status-inactive, .status-out-of-stock { background: #f8ecea; color: #a36e65; }.status-stock_in, .status-stock_out, .status-adjustment, .status-transfer { background: #f0f2ee; color: #718174; }
+.status-pending, .status-received, .status-low-stock { background: #f7f1e7; color: #a1844f; }.status-processing, .status-payment-verified, .status-packing, .status-shipped { background: #edf2f5; color: #66869b; }.status-delivered, .status-completed, .status-in-stock, .status-active { background: #edf4ec; color: #618064; }.status-cancelled, .status-inactive, .status-out-of-stock { background: #f8ecea; color: #a36e65; }.status-stock-in, .status-stock-out, .status-adjustment, .status-transfer { background: #f0f2ee; color: #718174; }
 .channel-tag { display: inline-flex; padding: 4px 8px; border-radius: 5px; background: #f6f7f4; color: #7b8980; font-size: 9px; }
 .low-stock-list { display: grid; }
 .low-stock-row { display: flex; align-items: center; gap: 9px; min-height: 55px; border-bottom: 1px solid #f0f2ef; }
