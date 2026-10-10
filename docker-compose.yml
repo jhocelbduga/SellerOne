@@ -1,0 +1,40 @@
+services:
+  inventory-service:
+    build:
+      context: .
+      args:
+        SERVICE_NAME: inventory
+    environment:
+      PORT: 3001
+    ports:
+      - "3001:3001"
+
+  orders-service:
+    build:
+      context: .
+      args:
+        SERVICE_NAME: orders
+    environment:
+      PORT: 3002
+    ports:
+      - "3002:3002"
+
+  customers-service:
+    build:
+      context: .
+      args:
+        SERVICE_NAME: customers
+    environment:
+      PORT: 3003
+    ports:
+      - "3003:3003"
+
+  accounting-service:
+    build:
+      context: .
+      args:
+        SERVICE_NAME: accounting
+    environment:
+      PORT: 3004
+    ports:
+      - "3004:3004"

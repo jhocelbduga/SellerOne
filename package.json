@@ -1,0 +1,20 @@
+{
+  "name": "sellerone",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "services/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "start:inventory": "npm run start --workspace @sellerone/inventory-service",
+    "start:orders": "npm run start --workspace @sellerone/orders-service",
+    "start:customers": "npm run start --workspace @sellerone/customers-service",
+    "start:accounting": "npm run start --workspace @sellerone/accounting-service"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  }
+}
