@@ -88,6 +88,10 @@ button { color: inherit; }
 .commerce-example { overflow-x: auto; padding: 14px; background: #edf0eb; border-radius: 8px; }
 .commerce-public { max-width: 880px; margin: 0 auto; padding: 24px 16px; }
 .commerce-filters { margin-bottom: 20px; }
+.commerce-stock-check { margin: 18px 0; padding: 14px; border: 1px solid #edf0eb; border-radius: 10px; }
+.commerce-stock-check ul { list-style: none; padding: 0; }
+.commerce-stock-check li { margin: 12px 0; padding-bottom: 12px; border-bottom: 1px solid #edf0eb; overflow-wrap: anywhere; }
+.commerce-stock-check h3 { margin-top: 0; }
 @media print { .commerce-no-print { display: none !important; } }
 .main-column { min-height: 100vh; margin-left: 246px; display: flex; flex-direction: column; }
 .topbar { position: sticky; top: 0; z-index: 20; height: 62px; flex: none; display: flex; align-items: center; justify-content: space-between; padding: 0 40px; border-bottom: 1px solid #ebeeea; background: rgba(255,255,255,.94); backdrop-filter: blur(14px); }

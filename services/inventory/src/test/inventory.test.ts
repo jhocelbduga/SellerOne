@@ -45,6 +45,67 @@ async function request(
   };
 }
 
+it("stores optional selling prices independently from cost and validates updates", async () => {
+  const created = await request("/products", "POST", { name: "Priced coffee", variants: [
+    { name: "Small", sku: "PRICE-S", uom: "cup", unitCostMinor: 100, sellingPriceMinor: 12550, currency: "PHP" },
+    { name: "Large", sku: "PRICE-L", uom: "cup", unitCostMinor: 200, currency: "PHP" },
+  ] });
+  assert.equal(created.status, 201);
+  const variants = created.body.variants as JsonObject[];
+  const small = variants.find((v) => v.sku === "PRICE-S")!;
+  const large = variants.find((v) => v.sku === "PRICE-L")!;
+  assert.equal(small.sellingPriceMinor, 12550);
+  assert.equal(large.sellingPriceMinor, null);
+  for (const invalid of [-1, 1.5, "100", Number.MAX_SAFE_INTEGER + 1]) {
+    assert.equal((await request(`/variants/${small.id}`, "PATCH", { sellingPriceMinor: invalid })).status, 400);
+  }
+  assert.equal((await request(`/variants/${small.id}`, "PATCH", { sellingPriceMinor: 0 })).status, 200);
+  let reread = (await request(`/products/${created.body.id}`)).body.variants as JsonObject[];
+  assert.equal(reread.find((v) => v.id === small.id)?.sellingPriceMinor, 0);
+  assert.equal(reread.find((v) => v.id === small.id)?.unitCostMinor, 100);
+  assert.equal((await request(`/variants/${small.id}`, "PATCH", { sellingPriceMinor: null })).status, 200);
+  reread = (await request(`/products/${created.body.id}`)).body.variants as JsonObject[];
+  assert.equal(reread.find((v) => v.id === small.id)?.sellingPriceMinor, null);
+  assert.equal((await request(`/variants/${large.id}`, "PATCH", { sellingPriceMinor: 19900 })).status, 200);
+});
+
+it("validates stock planning levels across create and partial updates without changing stock or UOM", async () => {
+  const created = await request("/products", "POST", { name: "Stock targets", variants: [
+    { name: "Cup", sku: "LEVEL-CUP", uom: "cup", unitCostMinor: 100, currency: "PHP", reorderPoint: 10, mediumStockLevel: 50, maximumStockLevel: 100 },
+    { name: "Milk", sku: "LEVEL-MILK", uom: "litre", unitCostMinor: 200, currency: "PHP" },
+  ] });
+  assert.equal(created.status, 201);
+  const variants = created.body.variants as JsonObject[];
+  const cup = variants.find((v) => v.sku === "LEVEL-CUP")!;
+  const milk = variants.find((v) => v.sku === "LEVEL-MILK")!;
+  assert.equal(cup.mediumStockLevel, 50);
+  assert.equal(cup.maximumStockLevel, 100);
+  assert.equal(milk.mediumStockLevel, null);
+  assert.equal(milk.maximumStockLevel, null);
+  for (const patch of [
+    { reorderPoint: 51 }, { mediumStockLevel: 9 }, { mediumStockLevel: 101 }, { maximumStockLevel: 49 },
+    { mediumStockLevel: -1 }, { maximumStockLevel: 1.5 }, { mediumStockLevel: "50" },
+    { maximumStockLevel: Number.MAX_SAFE_INTEGER + 1 },
+  ]) assert.equal((await request(`/variants/${cup.id}`, "PATCH", patch)).status, 400);
+  let reread = (await request(`/products/${created.body.id}`)).body.variants as JsonObject[];
+  assert.equal(reread.find((v) => v.id === cup.id)?.reorderPoint, 10);
+  assert.equal(reread.find((v) => v.id === cup.id)?.mediumStockLevel, 50);
+  assert.equal((await request(`/variants/${cup.id}`, "PATCH", { mediumStockLevel: null, maximumStockLevel: null })).status, 200);
+  assert.equal((await request(`/variants/${cup.id}`, "PATCH", { reorderPoint: 20, mediumStockLevel: 30, maximumStockLevel: 40 })).status, 200);
+  assert.equal((await request(`/variants/${cup.id}`, "PATCH", { name: "Updated cup" })).status, 200);
+  reread = (await request(`/products/${created.body.id}`)).body.variants as JsonObject[];
+  assert.equal(reread.find((v) => v.id === cup.id)?.maximumStockLevel, 40);
+  const stock = ((await request("/stock")).body.items as JsonObject[]).find((v) => v.variantId === cup.id)!;
+  assert.equal(stock.reorderPoint, 20);
+  assert.equal(stock.mediumStockLevel, 30);
+  assert.equal(stock.maximumStockLevel, 40);
+  assert.equal(stock.quantityOnHand, 0);
+  assert.equal(stock.uom, "cup");
+  assert.equal((await request("/products", "POST", { name: "Invalid targets", variants: [
+    { name: "Bad", sku: "LEVEL-BAD", unitCostMinor: 0, currency: "PHP", reorderPoint: 10, maximumStockLevel: 9 },
+  ] })).status, 400);
+});
+
 async function createProduct(reorderPoint = 0, description?: string): Promise<{ productId: string; variantId: string }> {
   const response = await request("/products", "POST", {
     name: "Coffee Beans",

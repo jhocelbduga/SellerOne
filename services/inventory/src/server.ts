@@ -96,8 +96,11 @@ function parseVariantInput(body: Record<string, unknown>): VariantInput {
     barcode: optionalString(body, "barcode", true) ?? undefined,
     attributes: optionalAttributes(body),
     unitCostMinor: requiredNumber(body, "unitCostMinor"),
+    sellingPriceMinor: body.sellingPriceMinor === null ? null : optionalNumber(body, "sellingPriceMinor"),
     currency: requiredString(body, "currency"),
     reorderPoint: optionalNumber(body, "reorderPoint"),
+    mediumStockLevel: body.mediumStockLevel === null ? null : optionalNumber(body, "mediumStockLevel"),
+    maximumStockLevel: body.maximumStockLevel === null ? null : optionalNumber(body, "maximumStockLevel"),
   };
 }
 
@@ -129,8 +132,11 @@ function parseVariantPatch(body: Record<string, unknown>): VariantPatch {
     barcode: optionalString(body, "barcode", true),
     attributes: optionalAttributes(body),
     unitCostMinor: optionalNumber(body, "unitCostMinor"),
+    sellingPriceMinor: body.sellingPriceMinor === null ? null : optionalNumber(body, "sellingPriceMinor"),
     currency: optionalString(body, "currency") ?? undefined,
     reorderPoint: optionalNumber(body, "reorderPoint"),
+    mediumStockLevel: body.mediumStockLevel === null ? null : optionalNumber(body, "mediumStockLevel"),
+    maximumStockLevel: body.maximumStockLevel === null ? null : optionalNumber(body, "maximumStockLevel"),
     active: optionalBoolean(body, "active"),
   };
 }

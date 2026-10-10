@@ -104,6 +104,64 @@ before(async () => {
 after(async () => { await stop(); rmSync(directory, { recursive: true, force: true }); });
 
 describe("social commerce platform", () => {
+  it("keeps shortages unverified then resumes the full workflow after receiving stock", async () => {
+    const variantId = await product(0);
+    const created = await order(variantId, 5, { items: [{ variantId, quantity: 2, unitPriceMinor: 500 }, { variantId, quantity: 3, unitPriceMinor: 500 }] });
+    const paymentId = await payment(created);
+    const blocked = await request(`/orders/${created.id}/verify-payment`, "POST", { paymentId });
+    assert.equal(blocked.status, 409);
+    assert.match(String(blocked.body.error), /Commerce test product.*Standard/);
+    assert.match(String(blocked.body.error), /available: 0 box/);
+    assert.match(String(blocked.body.error), /Main Warehouse/);
+    const unchanged = (await request(`/orders/${created.id}`)).body;
+    assert.equal(unchanged.stage, "received");
+    assert.equal((unchanged.payments as Row[])[0].status, "submitted");
+    assert.equal((await balance(variantId)).quantityReserved, 0);
+    assert.equal((await request("/stock/in", "POST", { variantId, quantity: 5, locationId: "main" })).status, 201);
+    assert.equal((await request(`/orders/${created.id}/verify-payment`, "POST", { paymentId })).status, 200);
+    assert.equal((await balance(variantId)).quantityReserved, 5);
+    assert.equal((await request(`/orders/${created.id}`, "PATCH", { stage: "packing" })).status, 200);
+    assert.equal((await request(`/orders/${created.id}`, "PATCH", { stage: "shipped", carrier: "Test courier" })).status, 200);
+    assert.equal((await balance(variantId)).quantityOnHand, 0);
+    assert.equal((await balance(variantId)).quantityReserved, 0);
+    assert.equal((await request(`/orders/${created.id}`, "PATCH", { stage: "delivered" })).status, 200);
+    assert.equal((await request(`/orders/${created.id}`, "PATCH", { stage: "completed" })).status, 200);
+    assert.equal((await request(`/orders/${created.id}`, "PATCH", { stage: "completed" })).status, 200);
+    const sales = ((await request("/sales")).body.items as Row[]).filter((row) => row.orderId === created.id);
+    assert.equal(sales.length, 1);
+    assert.equal(sales[0].amountMinor, 2500);
+  });
+
+  it("defaults order, import and offer prices from catalog while preserving overrides and snapshots", async () => {
+    const variantId = await product();
+    assert.equal((await request(`/variants/${variantId}`, "PATCH", { sellingPriceMinor: 12550 })).status, 200);
+    const created = await order(variantId, 2, { items: [{ variantId, quantity: 2 }] });
+    assert.equal(created.totalMinor, 25100);
+    const overridden = await order(variantId, 1, { items: [{ variantId, quantity: 1, unitPriceMinor: 9900 }] });
+    assert.equal(overridden.totalMinor, 9900);
+    const free = await order(variantId, 1, { items: [{ variantId, quantity: 1, unitPriceMinor: 0 }] });
+    assert.equal(free.totalMinor, 0);
+    const offer = await request("/checkout-links", "POST", { title: "Catalog price offer", currency: "PHP", items: [{ variantId, quantity: 1 }], validDays: 7 });
+    assert.equal(offer.status, 201);
+    const imported = await request("/orders/import", "POST", { channel: "Instagram", externalId: "catalog-price-import", customerName: "Price test", currency: "PHP", items: [{ variantId, quantity: 1 }] });
+    assert.equal(imported.status, 200);
+    assert.equal(imported.body.totalMinor, 12550);
+    assert.equal((await request(`/variants/${variantId}`, "PATCH", { sellingPriceMinor: 18000 })).status, 200);
+    assert.equal((await request(`/orders/${created.id}`)).body.totalMinor, 25100);
+    const publicOffer = await request(`/public/checkout/${String(offer.body.checkoutPath).split("/").at(-1)}`, "GET", undefined, "");
+    assert.equal((publicOffer.body.items as Row[])[0].unitPriceMinor, 12550);
+    assert.equal(JSON.stringify(publicOffer.body).includes("unitCostMinor"), false);
+    await stop(); await start();
+    const products = (await request("/products")).body.items as Row[];
+    const saved = products.flatMap((p) => p.variants as Row[]).find((v) => v.id === variantId);
+    assert.equal(saved?.sellingPriceMinor, 18000);
+    for (const invalid of [null, "500", -1]) {
+      assert.equal((await request("/orders", "POST", { customerName: "Price test", currency: "PHP", items: [{ variantId, quantity: 1, unitPriceMinor: invalid }] })).status, 400);
+    }
+    assert.equal((await request(`/variants/${variantId}`, "PATCH", { sellingPriceMinor: null })).status, 200);
+    assert.equal((await request("/orders", "POST", { customerName: "Unpriced test", currency: "PHP", items: [{ variantId, quantity: 1 }] })).status, 400);
+  });
+
   it("saves customer-specific social links with domain validation, removal and restart persistence", async () => {
     const links = {
       facebookUrl: "https://www.facebook.com/fictional.customer",

@@ -140,7 +140,8 @@ export class CommerceStore {
       if (!variant || !variant.active || !variant.product_active) fail("Choose an active catalog product variant.", 409);
       if (variant.currency !== currency) fail("All items must use the order currency.");
       const quantity = integer(item.quantity, "Quantity", 1);
-      const unitPriceMinor = integer(item.unitPriceMinor, "Selling price");
+      if (item.unitPriceMinor === undefined && variant.selling_price_minor === null) fail("Set a catalog selling price or provide an explicit selling price.");
+      const unitPriceMinor = integer(item.unitPriceMinor === undefined ? variant.selling_price_minor : item.unitPriceMinor, "Selling price");
       const totalMinor = quantity * unitPriceMinor;
       if (!Number.isSafeInteger(totalMinor)) fail("Line total is outside the supported range.");
       return {

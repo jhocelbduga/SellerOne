@@ -513,6 +513,54 @@ Each Expenses table entry has a **View details** action that opens its full
 description, category, recorded date, amount/currency, notes, and entry ID in a
 read-only dialog. Opening details does not change or create a transaction.
 
+### Stock planning levels
+
+Each variant uses its existing UOM for editable minimum, medium, and maximum
+stock levels in the product editor. The minimum is the existing `reorderPoint`:
+low-stock alerts still flag on-hand stock at or below that quantity. Optional
+`mediumStockLevel` and `maximumStockLevel` are nullable planning targets, not
+automatic replenishment triggers or hard receipt limits. Existing variants keep
+their reorder points and migrate with the optional targets unset.
+
+Levels must be non-negative whole numbers satisfying minimum <= medium <= maximum
+for the targets that are set. Create and patch APIs validate the combined saved
+levels; omitted patch fields are preserved and null clears an optional target.
+Inventory displays all three levels alongside each variant's UOM. No unit
+conversion or ingredient-to-drink production is performed.
+
+Test stock receipts are explicit inventory movements and affect stock balances
+and valuation. They do not create expenses or verify pending order payments.
+
+### Saved selling prices
+
+Set **Selling prices per UOM** in the product editor for each variant, including
+every drink size. Inline product creation during stock receiving also accepts
+an optional selling price. Prices use the variant's currency and UOM, separately
+from inventory unit cost. Existing variants start without a selling price; no
+prices are inferred from costs or recipes. Blank removes a saved price; zero is
+an explicit free price. API create/patch uses optional `sellingPriceMinor`
+(non-negative integer minor units, or `null` to clear).
+
+Selecting a product in a manual order or checkout-offer form fills its saved
+selling price. Selecting a different product resets the field to that product's
+price (blank when unset). Sellers may override prices for that order/offer
+without changing the catalog. Orders, imports and checkout offers may omit
+`unitPriceMinor` to use the current catalog price; if none is saved, explicit
+pricing is required. Captured orders and offers retain their price snapshots
+after catalog changes. Public checkout continues to use the offer's price,
+never client-supplied prices or catalog costs. No ingredient deduction or unit
+conversion is added.
+
+Received orders show item-level required, available, and reserved quantities
+at their fulfillment location, with repeated items combined. Shortages provide
+a Receive stock link that preselects the variant, location, and shortage
+quantity. Receiving still requires an explicit confirmed movement. Return to
+the order to retry verification; neither the link nor the stock availability
+refresh automatically verifies payment. Insufficient stock continues to roll
+back verification and reservations. Finished drink stock is separate from
+ingredient inventory; no recipe reservation, deduction, or unit conversion is
+implied by this workflow.
+
 Inventory shows on-hand, reserved, and available quantities per UOM/location.
 Manual stock-outs, transfers, and physical-count adjustments cannot consume
 reserved stock. There is no unit conversion. Pre-dispatch cancellation releases

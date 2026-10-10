@@ -5,7 +5,7 @@ import { api, dateLabel, money, useLoad } from "./api";
 const channels = ["Manual", "TikTok Shop", "Facebook Marketplace", "Facebook Page", "Facebook Messenger", "Instagram", "Shareable Order Link"];
 const carriers = ["J&T Express", "JRS Express", "LBC Express", "Ninja Van", "Flash Express", "SPX Express", "GoGo Xpress", "GrabExpress", "Lalamove"];
 const stages = ["received", "payment_verified", "packing", "shipped", "delivered", "completed", "cancelled"];
-interface Variant { id: string; name: string; sku: string; uom: string; currency: string; active: boolean }
+interface Variant { id: string; name: string; sku: string; uom: string; currency: string; active: boolean; sellingPriceMinor: number | null }
 interface Product { id: string; name: string; active: boolean; variants: Variant[] }
 interface CartLine { key: string; variantId: string; quantity: string; price: string }
 interface Item { id?: string; variantId?: string; description: string; sku?: string; uom: string; quantity: number; unitPriceMinor: number; totalMinor: number }
@@ -14,7 +14,7 @@ interface Event { sequence: number; stage: string; message: string; actor?: stri
 interface Communication { id: string; message: string; status?: string; actor?: string; createdAt: string }
 interface Order {
   id: string; orderNumber: string; customerId?: string; customerName: string; customerEmail?: string; customerPhone?: string;
-  shippingAddress?: string; channel: string; externalId?: string; stage: string; paymentStatus?: string;
+  shippingAddress?: string; channel: string; externalId?: string; stage: string; paymentStatus?: string; locationId: string;
   totalMinor: number; currency: string; createdAt: string; notes?: string; carrier?: string; trackingNumber?: string;
   trackingPath: string | null; invoiceNumber: string; items: Item[]; payments: Payment[]; timeline: Event[];
   businessName: string;
@@ -90,6 +90,35 @@ function CustomerFields({ required = false }: { required?: boolean }): React.JSX
   </div>;
 }
 
+function OrderStockCheck({ order }: { order: Order }): React.JSX.Element {
+  const stock = useLoad<{ items: { variantId: string; sku: string; uom: string; locationName: string; quantityOnHand: number; quantityReserved: number; quantityAvailable: number }[] }>(`/stock?locationId=${encodeURIComponent(order.locationId)}`);
+  const requirements = new Map<string, { item: Item; quantity: number }>();
+  for (const item of order.items) {
+    const key = item.variantId ?? item.sku ?? item.description;
+    const existing = requirements.get(key);
+    requirements.set(key, { item, quantity: (existing?.quantity ?? 0) + item.quantity });
+  }
+  return <div className="commerce-stock-check">
+    <h3>Stock required before payment verification</h3>
+    <p>Stock is checked at this order's fulfillment location. Ingredient stock does not supply finished drinks; recipe deduction and unit conversion are not enabled.</p>
+    <ErrorBox message={stock.error} />
+    {stock.loading ? <p>Checking available stock...</p> : !stock.error && <ul>{[...requirements].map(([key, { item, quantity }]) => {
+      const balance = stock.data?.items.find((row) => item.variantId ? row.variantId === item.variantId : row.sku === item.sku);
+      const available = balance?.quantityAvailable ?? 0;
+      const shortage = Math.max(0, quantity - available);
+      const uomChanged = balance && balance.uom !== item.uom;
+      const query = new URLSearchParams({ receive: balance?.variantId ?? item.variantId ?? "", locationId: order.locationId, quantity: String(shortage || quantity), orderId: order.id });
+      return <li key={key}><strong>{item.description}</strong><p>Required: {quantity} {item.uom} · Available: {available} {balance?.uom ?? item.uom} · Reserved: {balance?.quantityReserved ?? 0} {balance?.uom ?? item.uom}{balance ? ` · ${balance.locationName}` : ""}</p>
+        {uomChanged ? <p role="alert">Catalog UOM changed. Cancel and recreate this order with the current UOM.</p>
+          : shortage > 0 && <><p role="alert">Shortage: {shortage} {item.uom}. Receive stock before retrying verification.</p>{(balance || item.variantId) && <Link className="inline-link" to={`/inventory?${query}`}>Receive stock for {item.description}</Link>}</>}
+        {!balance && <p role="alert">No matching inventory balance found. Check the catalog variant and fulfillment location.</p>}
+      </li>;
+    })}</ul>}
+    <button type="button" className="button button-secondary" disabled={stock.loading} onClick={stock.reload}>Refresh stock availability</button>
+    <p>Refreshing does not verify payment or reserve stock. The server rechecks availability atomically when you verify payment.</p>
+  </div>;
+}
+
 function CaptureForm({ linkMode, saved }: { linkMode: boolean; saved: (order?: Order) => void }): React.JSX.Element {
   const products = useLoad<{ items: Product[] }>("/products");
   const locations = useLoad<{ items: { id: string; name: string }[] }>("/locations");
@@ -122,9 +151,12 @@ function CaptureForm({ linkMode, saved }: { linkMode: boolean; saved: (order?: O
     <div className="form-grid"><label className="field-label">Source channel<select name="channel" defaultValue={linkMode ? "Shareable Order Link" : "Manual"}>{channels.map((channel) => <option key={channel}>{channel}</option>)}</select></label>
       <label className="field-label">Fulfillment location<select name="locationId" required>{locations.data?.items.map((location) => <option key={location.id} value={location.id}>{location.name}</option>)}</select></label></div>
     {lines.map((line, index) => <div className="commerce-cart-line" key={line.key}>
-      <label className="field-label">Product {index + 1}<select required value={line.variantId} onChange={(event) => edit(line.key, { variantId: event.target.value })}><option value="">Choose an active variant</option>{variants.map((variant) => <option key={variant.id} value={variant.id}>{variant.productName} · {variant.name} ({variant.sku}, {variant.uom}, {variant.currency})</option>)}</select></label>
+      <label className="field-label">Product {index + 1}<select required value={line.variantId} onChange={(event) => {
+        const variant = variants.find((variant) => variant.id === event.target.value);
+        edit(line.key, { variantId: event.target.value, price: variant?.sellingPriceMinor == null ? "" : (variant.sellingPriceMinor / 100).toFixed(2) });
+      }}><option value="">Choose an active variant</option>{variants.map((variant) => <option key={variant.id} value={variant.id}>{variant.productName} · {variant.name} ({variant.sku}, {variant.uom}, {variant.currency})</option>)}</select></label>
       <div className="form-grid">{!linkMode && <label className="field-label">Quantity<input type="number" required min={1} step={1} value={line.quantity} onChange={(event) => edit(line.key, { quantity: event.target.value })} /></label>}
-        <label className="field-label">Selling price per UOM<input required type="number" min={0} step="0.01" value={line.price} onChange={(event) => edit(line.key, { price: event.target.value })} /></label></div>
+        <label className="field-label">Selling price per UOM<input required type="number" min={0} step="0.01" value={line.price} onChange={(event) => edit(line.key, { price: event.target.value })} /><small>Auto-filled from the selected variant's saved price. Override for this {linkMode ? "offer" : "order"} only. Switching products resets the price; variants without a saved price require manual entry.</small></label></div>
       {lines.length > 1 && <button className="button button-secondary" type="button" onClick={() => setLines((current) => current.filter((item) => item.key !== line.key))}>Remove item {index + 1}</button>}
     </div>)}
     <button className="button button-secondary" type="button" disabled={lines.length >= 50} onClick={() => setLines((current) => [...current, { key: crypto.randomUUID(), variantId: "", quantity: "1", price: "" }])}>Add another item</button>
@@ -196,7 +228,7 @@ export function CommerceOrderDetails({ role }: { role: string }): React.JSX.Elem
   const run = async (action: string, body: Record<string, unknown>, method = "POST") => {
     setBusy(true); setError(""); setNotice("");
     try { await api(`/orders/${id}${action ? `/${action}` : ""}`, { method, body: JSON.stringify(body) }); setNotice("Order updated."); order.reload(); }
-    catch (caught) { setError(caught instanceof Error ? caught.message : "Order update failed."); }
+    catch (caught) { setError(caught instanceof Error ? caught.message : "Order update failed."); if (action === "verify-payment") order.reload(); }
     finally { setBusy(false); }
   };
   const fromForm = (event: React.FormEvent<HTMLFormElement>, action: string) => { event.preventDefault(); void run(action, Object.fromEntries(new FormData(event.currentTarget))); };
@@ -219,6 +251,7 @@ export function CommerceOrderDetails({ role }: { role: string }): React.JSX.Elem
         {completed && <button className="button button-primary" disabled>Mark Completed</button>}
         {canCancel && <button className="button button-secondary" disabled={busy} onClick={() => { if (window.confirm("Cancel this order and release its reserved stock? A verified payment will require a manual refund.")) void run("", { stage: "cancelled" }, "PATCH"); }}>Cancel order</button>}
       </div>
+      {data.stage === "received" && <OrderStockCheck order={data} />}
       {data.stage === "packing" && <ShipmentForm busy={busy} submit={(body) => run("", body, "PATCH")} />}
       <ShipmentDetails carrier={data.carrier} trackingNumber={data.trackingNumber} />
       {canCancel && <><button className="button button-secondary" onClick={() => setShipping(!shipping)}>Edit shipping details</button>{shipping && <form className="modal-form" onSubmit={(event) => fromForm(event, "shipping")}><label className="field-label">Customer phone<input name="customerPhone" defaultValue={data.customerPhone} required maxLength={50} /></label><label className="field-label">Shipping address<textarea name="shippingAddress" defaultValue={data.shippingAddress} required maxLength={1000} /></label><button className="button button-primary" disabled={busy}>Save shipping details</button></form>}</>}

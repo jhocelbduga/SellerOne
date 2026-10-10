@@ -21,8 +21,11 @@ export interface VariantInput {
   barcode?: string;
   attributes?: Record<string, string>;
   unitCostMinor: number;
+  sellingPriceMinor?: number | null;
   currency: string;
   reorderPoint?: number;
+  mediumStockLevel?: number | null;
+  maximumStockLevel?: number | null;
 }
 
 export interface ProductInput {
@@ -45,8 +48,11 @@ export interface VariantPatch {
   barcode?: string | null;
   attributes?: Record<string, string>;
   unitCostMinor?: number;
+  sellingPriceMinor?: number | null;
   currency?: string;
   reorderPoint?: number;
+  mediumStockLevel?: number | null;
+  maximumStockLevel?: number | null;
   active?: boolean;
 }
 
@@ -186,9 +192,21 @@ function validateVariant(input: VariantInput): VariantInput & { sku: string; uom
     barcode: optionalText(input.barcode, "barcode", 100) ?? undefined,
     attributes: stringAttributes(input.attributes),
     unitCostMinor: nonNegativeInteger(input.unitCostMinor, "unitCostMinor"),
+    sellingPriceMinor: input.sellingPriceMinor == null ? null : nonNegativeInteger(input.sellingPriceMinor, "sellingPriceMinor"),
     currency: currencyCode(input.currency),
-    reorderPoint: nonNegativeInteger(input.reorderPoint ?? 0, "reorderPoint"),
+    ...validateStockLevels(input.reorderPoint ?? 0, input.mediumStockLevel ?? null, input.maximumStockLevel ?? null),
   };
+}
+
+function validateStockLevels(minimum: unknown, medium: unknown, maximum: unknown): { reorderPoint: number; mediumStockLevel: number | null; maximumStockLevel: number | null } {
+  const reorderPoint = nonNegativeInteger(minimum, "reorderPoint");
+  const mediumStockLevel = medium === null ? null : nonNegativeInteger(medium, "mediumStockLevel");
+  const maximumStockLevel = maximum === null ? null : nonNegativeInteger(maximum, "maximumStockLevel");
+  if ((mediumStockLevel !== null && mediumStockLevel < reorderPoint)
+    || (maximumStockLevel !== null && maximumStockLevel < (mediumStockLevel ?? reorderPoint))) {
+    throw new InventoryError("Stock levels must satisfy minimum <= medium <= maximum in the variant's UOM.", 400);
+  }
+  return { reorderPoint, mediumStockLevel, maximumStockLevel };
 }
 
 export class InventoryStore {
@@ -284,6 +302,9 @@ export class InventoryStore {
     `);
     this.ensureColumn("variants", "description", "TEXT");
     this.ensureColumn("variants", "uom", "TEXT NOT NULL DEFAULT 'pcs'");
+    this.ensureColumn("variants", "selling_price_minor", "INTEGER CHECK (selling_price_minor >= 0)");
+    this.ensureColumn("variants", "medium_stock_level", "INTEGER CHECK (medium_stock_level >= 0)");
+    this.ensureColumn("variants", "maximum_stock_level", "INTEGER CHECK (maximum_stock_level >= 0)");
     this.ensureColumn("batches", "variant_description", "TEXT");
     this.database.prepare(`
       INSERT OR IGNORE INTO locations (id, name, created_at)
@@ -459,6 +480,10 @@ export class InventoryStore {
       fields.push("unit_cost_minor = ?");
       values.push(nonNegativeInteger(patch.unitCostMinor, "unitCostMinor"));
     }
+    if (patch.sellingPriceMinor !== undefined) {
+      fields.push("selling_price_minor = ?");
+      values.push(patch.sellingPriceMinor === null ? null : nonNegativeInteger(patch.sellingPriceMinor, "sellingPriceMinor"));
+    }
     if (patch.currency !== undefined) {
       const currency = currencyCode(patch.currency);
       if (currency !== String(existing.currency)) {
@@ -473,9 +498,15 @@ export class InventoryStore {
       fields.push("currency = ?");
       values.push(currency);
     }
-    if (patch.reorderPoint !== undefined) {
-      fields.push("reorder_point = ?");
-      values.push(nonNegativeInteger(patch.reorderPoint, "reorderPoint"));
+    if (patch.reorderPoint !== undefined || patch.mediumStockLevel !== undefined || patch.maximumStockLevel !== undefined) {
+      const levels = this.database.prepare("SELECT reorder_point, medium_stock_level, maximum_stock_level FROM variants WHERE id = ?").get(id)!;
+      const validated = validateStockLevels(
+        patch.reorderPoint === undefined ? levels.reorder_point : patch.reorderPoint,
+        patch.mediumStockLevel === undefined ? levels.medium_stock_level : patch.mediumStockLevel,
+        patch.maximumStockLevel === undefined ? levels.maximum_stock_level : patch.maximumStockLevel,
+      );
+      fields.push("reorder_point = ?", "medium_stock_level = ?", "maximum_stock_level = ?");
+      values.push(validated.reorderPoint, validated.mediumStockLevel, validated.maximumStockLevel);
     }
     if (patch.active !== undefined) {
       if (typeof patch.active !== "boolean") {
@@ -777,6 +808,8 @@ export class InventoryStore {
         l.id AS locationId,
         l.name AS locationName,
         v.reorder_point AS reorderPoint,
+        v.medium_stock_level AS mediumStockLevel,
+        v.maximum_stock_level AS maximumStockLevel,
         v.unit_cost_minor AS unitCostMinor,
         v.currency,
         COALESCE(SUM(b.remaining_quantity), 0) AS quantityOnHand,
@@ -940,8 +973,11 @@ export class InventoryStore {
         EXISTS (SELECT 1 FROM movements m WHERE m.variant_id = variants.id) AS uomLocked,
         attributes_json AS attributesJson,
         unit_cost_minor AS unitCostMinor,
+        selling_price_minor AS sellingPriceMinor,
         currency,
         reorder_point AS reorderPoint,
+        medium_stock_level AS mediumStockLevel,
+        maximum_stock_level AS maximumStockLevel,
         active,
         created_at AS createdAt,
         updated_at AS updatedAt
@@ -964,8 +1000,8 @@ export class InventoryStore {
     this.database.prepare(`
       INSERT INTO variants (
         id, product_id, name, description, sku, barcode, attributes_json, uom,
-        unit_cost_minor, currency, reorder_point, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        unit_cost_minor, selling_price_minor, currency, reorder_point, medium_stock_level, maximum_stock_level, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       randomUUID(),
       productId,
@@ -976,8 +1012,11 @@ export class InventoryStore {
       JSON.stringify(variant.attributes ?? {}),
       variant.uom,
       variant.unitCostMinor,
+      variant.sellingPriceMinor ?? null,
       variant.currency,
       variant.reorderPoint ?? 0,
+      variant.mediumStockLevel ?? null,
+      variant.maximumStockLevel ?? null,
       now,
       now,
     );
@@ -1018,7 +1057,7 @@ export class InventoryStore {
     }
   }
 
-  private getStockItem(variantId: string, locationId: string): object {
+  private getStockItem(variantId: string, locationId: string): Record<string, unknown> {
     const row = this.database.prepare(`
       SELECT
         v.id AS variantId,
@@ -1032,6 +1071,8 @@ export class InventoryStore {
         l.id AS locationId,
         l.name AS locationName,
         v.reorder_point AS reorderPoint,
+        v.medium_stock_level AS mediumStockLevel,
+        v.maximum_stock_level AS maximumStockLevel,
         v.unit_cost_minor AS unitCostMinor,
         v.currency,
         COALESCE(SUM(b.remaining_quantity), 0) AS quantityOnHand,
@@ -1065,7 +1106,8 @@ export class InventoryStore {
 
   private assertAvailable(variantId: string, locationId: string, quantity: number): void {
     if (quantity > this.quantityOnHand(variantId, locationId) - this.reservedQuantity(variantId, locationId)) {
-      throw new InventoryError("Insufficient available stock; some stock may be reserved for orders.", 409);
+      const stock = this.getStockItem(variantId, locationId);
+      throw new InventoryError(`Insufficient available stock for ${stock.productName} · ${stock.variantName} (${stock.sku}) at ${stock.locationName}. Required: ${quantity} ${stock.uom}; available: ${stock.quantityAvailable} ${stock.uom}; reserved: ${stock.quantityReserved} ${stock.uom}. Receive stock before retrying.`, 409);
     }
   }
 

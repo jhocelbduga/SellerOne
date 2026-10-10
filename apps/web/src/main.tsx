@@ -44,8 +44,11 @@ interface Variant {
   barcode?: string | null;
   attributes: Record<string, string>;
   unitCostMinor: number;
+  sellingPriceMinor: number | null;
   currency: string;
   reorderPoint: number;
+  mediumStockLevel: number | null;
+  maximumStockLevel: number | null;
 }
 interface Customer {
   id: string;
@@ -517,6 +520,8 @@ function ProductFormPage(): React.JSX.Element {
   const product = editing ? existing.data : null;
   const [form, setForm] = useState({ name: "", description: "", variantName: "Standard", variantDescription: "", uom: "pcs", sku: "", barcode: "", unitCost: "", currency: "PHP", reorderPoint: "0", attributes: "" });
   const [initialized, setInitialized] = useState(false);
+  const [sellingPrices, setSellingPrices] = useState<Record<string, string>>({ new: "" });
+  const [stockLevels, setStockLevels] = useState<Record<string, { minimum: string; medium: string; maximum: string }>>({ new: { minimum: "0", medium: "", maximum: "" } });
   useEffect(() => {
     if (product && !initialized) {
       const variant = product.variants[0];
@@ -534,12 +539,29 @@ function ProductFormPage(): React.JSX.Element {
         attributes: Object.entries(variant?.attributes ?? {}).map(([key, value]) => `${key}=${value}`).join("\n"),
       });
       setInitialized(true);
+      setSellingPrices(Object.fromEntries(product.variants.map((variant) => [variant.id, variant.sellingPriceMinor == null ? "" : (variant.sellingPriceMinor / 100).toFixed(2)])));
+      setStockLevels(Object.fromEntries(product.variants.map((variant) => [variant.id, { minimum: String(variant.reorderPoint), medium: variant.mediumStockLevel == null ? "" : String(variant.mediumStockLevel), maximum: variant.maximumStockLevel == null ? "" : String(variant.maximumStockLevel) }])));
     }
   }, [product, initialized]);
   const input = (key: keyof typeof form) => (event: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>) => setForm((value) => ({ ...value, [key]: event.target.value }));
   const submit = async (event: React.FormEvent) => {
     event.preventDefault(); setError(""); setNotice(""); setSaving(true);
     try {
+      const prices = Object.fromEntries(Object.entries(sellingPrices).map(([key, value]) => {
+        const minor = value.trim() === "" ? null : Math.round(Number(value) * 100);
+        if (minor !== null && (!Number.isSafeInteger(minor) || minor < 0)) throw new Error("Enter valid non-negative selling prices.");
+        return [key, minor];
+      }));
+      const levels = Object.fromEntries(Object.entries(stockLevels).map(([key, value]) => {
+        const minimum = key === (product?.variants[0]?.id ?? "new") ? Number(form.reorderPoint) : Number(value.minimum);
+        const medium = value.medium.trim() === "" ? null : Number(value.medium);
+        const maximum = value.maximum.trim() === "" ? null : Number(value.maximum);
+        if ([minimum, medium, maximum].some((level) => level !== null && (!Number.isSafeInteger(level) || level < 0))
+          || (medium !== null && medium < minimum) || (maximum !== null && maximum < (medium ?? minimum))) {
+          throw new Error("Enter whole-number stock levels with minimum <= medium <= maximum.");
+        }
+        return [key, { reorderPoint: minimum, mediumStockLevel: medium, maximumStockLevel: maximum }];
+      }));
       const attributes = Object.fromEntries(form.attributes.split("\n").filter(Boolean).map((line) => {
         const separator = line.indexOf("=");
         return separator < 1 ? ["", ""] : [line.slice(0, separator).trim(), line.slice(separator + 1).trim()];
@@ -550,8 +572,15 @@ function ProductFormPage(): React.JSX.Element {
         if (variant) await api(`/variants/${variant.id}`, { method: "PATCH", body: JSON.stringify({
           name: form.variantName, description: form.variantDescription || null, uom: form.uom, sku: form.sku, barcode: form.barcode || null, attributes,
           unitCostMinor: Math.round(Number(form.unitCost) * 100), currency: form.currency,
-          reorderPoint: Number(form.reorderPoint),
+          sellingPriceMinor: prices[variant.id],
+          ...levels[variant.id],
         }) });
+        for (const additional of product.variants.slice(1)) {
+          const targets = levels[additional.id];
+          if (prices[additional.id] !== additional.sellingPriceMinor || targets.reorderPoint !== additional.reorderPoint || targets.mediumStockLevel !== additional.mediumStockLevel || targets.maximumStockLevel !== additional.maximumStockLevel) {
+            await api(`/variants/${additional.id}`, { method: "PATCH", body: JSON.stringify({ sellingPriceMinor: prices[additional.id], ...targets }) });
+          }
+        }
         setNotice("Your product has been updated.");
         window.setTimeout(() => navigate("/products"), 650);
       } else {
@@ -561,7 +590,8 @@ function ProductFormPage(): React.JSX.Element {
             name: form.variantName, uom: form.uom, sku: form.sku, barcode: form.barcode || undefined,
             description: form.variantDescription || undefined,
             attributes, unitCostMinor: Math.round(Number(form.unitCost) * 100),
-            currency: form.currency, reorderPoint: Number(form.reorderPoint),
+            sellingPriceMinor: prices.new,
+            currency: form.currency, ...levels.new,
           }],
         }) });
         navigate("/products");
@@ -577,8 +607,29 @@ function ProductFormPage(): React.JSX.Element {
     <PageHeading eyebrow={editing ? "CATALOG / EDIT" : "CATALOG / NEW"} title={editing ? "Edit product" : "Add a product"} description={editing ? "Update your product details and variant." : "Give your product a name and the details you’ll need later."} />
     <form className="form-layout" onSubmit={(event) => void submit(event)}>
       <section className="panel form-panel"><SectionHeading title="The basics" subtitle="A clear name makes everything easier." /><div className="form-grid"><label className="field-label field-span">Product name<input required maxLength={200} placeholder="e.g. House blend coffee" value={form.name} onChange={input("name")} /></label><label className="field-label field-span">Description <span className="field-optional">OPTIONAL</span><textarea rows={3} maxLength={2000} placeholder="What makes this one special?" value={form.description} onChange={input("description")} /></label></div></section>
-      <section className="panel form-panel"><SectionHeading title="First variant" subtitle="Add sizes, colours, or other options later." /><div className="form-grid"><label className="field-label">Variant name<input required maxLength={200} placeholder="Standard" value={form.variantName} onChange={input("variantName")} /></label><label className="field-label">Variant description <span className="field-optional">OPTIONAL</span><textarea rows={2} maxLength={2000} placeholder="Identify this variant for receiving and stock reports" value={form.variantDescription} onChange={input("variantDescription")} /></label><label className="field-label">SKU<input required maxLength={100} placeholder="e.g. COFFEE-250" value={form.sku} onChange={input("sku")} /></label><label className="field-label">Barcode <span className="field-optional">OPTIONAL</span><input maxLength={100} placeholder="Scan or type a barcode" value={form.barcode} onChange={input("barcode")} /></label><label className="field-label">Unit cost<input required type="number" min="0" step="0.01" placeholder="0.00" value={form.unitCost} onChange={input("unitCost")} /></label><label className="field-label">Currency<select value={form.currency} onChange={input("currency")}><option value="PHP">PHP — Philippine peso</option><option value="USD">USD — US dollar</option><option value="SGD">SGD — Singapore dollar</option><option value="AUD">AUD — Australian dollar</option><option value="EUR">EUR — Euro</option><option value="GBP">GBP — British pound</option></select></label><label className="field-label">Reorder point<input required type="number" min="0" step="1" value={form.reorderPoint} onChange={input("reorderPoint")} /><small>We’ll flag stock at or below this level.</small></label><label className="field-label field-span">Variant attributes <span className="field-optional">ONE PER LINE · KEY=VALUE</span><textarea rows={3} placeholder={"size=250 g\ncolour=Dark roast"} value={form.attributes} onChange={input("attributes")} /></label></div></section>
+      <section className="panel form-panel"><SectionHeading title="First variant" subtitle="Add sizes, colours, or other options later." /><div className="form-grid">
+        <label className="field-label">Variant name<input required maxLength={200} placeholder="Standard" value={form.variantName} onChange={input("variantName")} /></label>
+        <label className="field-label">Variant description <span className="field-optional">OPTIONAL</span><textarea rows={2} maxLength={2000} placeholder="Identify this variant for receiving and stock reports" value={form.variantDescription} onChange={input("variantDescription")} /></label>
+        <label className="field-label">SKU<input required maxLength={100} placeholder="e.g. COFFEE-250" value={form.sku} onChange={input("sku")} /></label>
+        <label className="field-label">Barcode <span className="field-optional">OPTIONAL</span><input maxLength={100} placeholder="Scan or type a barcode" value={form.barcode} onChange={input("barcode")} /></label>
+        <label className="field-label">Unit cost<input required type="number" min="0" step="0.01" placeholder="0.00" value={form.unitCost} onChange={input("unitCost")} /></label>
+        <label className="field-label">Currency<select value={form.currency} onChange={input("currency")}><option value="PHP">PHP — Philippine peso</option><option value="USD">USD — US dollar</option><option value="SGD">SGD — Singapore dollar</option><option value="AUD">AUD — Australian dollar</option><option value="EUR">EUR — Euro</option><option value="GBP">GBP — British pound</option></select></label>
+        <label className="field-label field-span">Variant attributes <span className="field-optional">ONE PER LINE · KEY=VALUE</span><textarea rows={3} placeholder={"size=250 g\ncolour=Dark roast"} value={form.attributes} onChange={input("attributes")} /></label>
+      </div></section>
       <section className="panel form-panel"><UomField value={form.uom} onChange={(uom) => setForm((current) => ({ ...current, uom }))} locked={product?.variants[0]?.uomLocked} /></section>
+      <section className="panel form-panel"><SectionHeading title="Selling prices per UOM" subtitle="Saved defaults for orders and checkout offers. Leave blank for manual pricing; zero is an explicit free price." /><div className="form-grid">
+        {(product ? product.variants : [{ id: "new", name: form.variantName, uom: form.uom, currency: form.currency }]).map((variant, index) => <label key={variant.id} className="field-label">{variant.name} selling price ({index === 0 ? form.currency : variant.currency} / {index === 0 ? form.uom : variant.uom})<input type="number" min="0" step="0.01" value={sellingPrices[variant.id] ?? ""} onChange={(event) => setSellingPrices((current) => ({ ...current, [variant.id]: event.target.value }))} /></label>)}
+      </div></section>
+      <section className="panel form-panel"><SectionHeading title="Stock levels per UOM" subtitle="Minimum is the reorder point. Medium and maximum are planning targets, not automatic receipts or hard stock limits. Leave optional targets blank if unset." /><div className="form-grid">
+        {(product ? product.variants : [{ id: "new", name: form.variantName, uom: form.uom }]).map((variant, index) => <div key={variant.id} className="field-span">
+          <h3>{variant.name} ({index === 0 ? form.uom : variant.uom})</h3>
+          <div className="form-grid">
+            <label className="field-label">Minimum stock ({index === 0 ? form.uom : variant.uom})<input required type="number" min="0" step="1" value={index === 0 ? form.reorderPoint : stockLevels[variant.id]?.minimum ?? "0"} onChange={(event) => index === 0 ? setForm((current) => ({ ...current, reorderPoint: event.target.value })) : setStockLevels((current) => ({ ...current, [variant.id]: { ...current[variant.id], minimum: event.target.value } }))} /></label>
+            <label className="field-label">Medium stock ({index === 0 ? form.uom : variant.uom})<input type="number" min="0" step="1" value={stockLevels[variant.id]?.medium ?? ""} onChange={(event) => setStockLevels((current) => ({ ...current, [variant.id]: { ...current[variant.id], medium: event.target.value } }))} /></label>
+            <label className="field-label">Maximum stock ({index === 0 ? form.uom : variant.uom})<input type="number" min="0" step="1" value={stockLevels[variant.id]?.maximum ?? ""} onChange={(event) => setStockLevels((current) => ({ ...current, [variant.id]: { ...current[variant.id], maximum: event.target.value } }))} /></label>
+          </div>
+        </div>)}
+      </div></section>
       {error && <PageError message={error} />}{notice && <div className="success-box"><ShieldCheck size={17} />{notice}</div>}
       <div className="form-actions"><Link className="button button-secondary" to="/products">Cancel</Link><Button type="submit" disabled={saving}>{saving ? "Saving…" : editing ? "Save changes" : "Save product"} <ChevronRight size={16} /></Button></div>
     </form>
@@ -586,6 +637,12 @@ function ProductFormPage(): React.JSX.Element {
 }
 
 function InventoryPage(): React.JSX.Element {
+  const location = useLocation();
+  const products = useLoad<{ items: Product[] }>("/products");
+  const receiptQuery = new URLSearchParams(location.search);
+  const receiveVariantId = receiptQuery.get("receive");
+  const returnOrderId = receiptQuery.get("orderId");
+  const [openedReceiptQuery, setOpenedReceiptQuery] = useState("");
   const stock = useLoad<{ items: Record<string, unknown>[] }>("/stock");
   const batches = useLoad<{ items: Record<string, unknown>[] }>("/batches");
   const locations = useLoad<{ items: Record<string, unknown>[] }>("/locations");
@@ -596,15 +653,27 @@ function InventoryPage(): React.JSX.Element {
   const [selectedVariantId, setSelectedVariantId] = useState("");
   const [createdProduct, setCreatedProduct] = useState<Product | null>(null);
   const [savingProduct, setSavingProduct] = useState(false);
-  const [newProduct, setNewProduct] = useState({ name: "", variantName: "Standard", uom: "pcs", sku: "", unitCost: "", currency: "PHP", description: "" });
+  const [newProduct, setNewProduct] = useState({ name: "", variantName: "Standard", uom: "pcs", sku: "", unitCost: "", sellingPrice: "", currency: "PHP", description: "" });
   useEffect(() => {
-    setVariantDescription("");
-    setSelectedVariantId("");
-    setUom("pcs");
-    setNewProduct({ name: "", variantName: "Standard", uom: "pcs", sku: "", unitCost: "", currency: "PHP", description: "" });
-  }, [modal]);
+    const variant = modal === "in" && receiveVariantId ? products.data?.items.flatMap((product) => product.variants).find((variant) => variant.id === receiveVariantId) : undefined;
+    setVariantDescription(variant?.description ?? "");
+    setSelectedVariantId(variant?.id ?? "");
+    setUom(variant?.uom ?? "pcs");
+    setNewProduct({ name: "", variantName: "Standard", uom: "pcs", sku: "", unitCost: "", sellingPrice: "", currency: "PHP", description: "" });
+  }, [modal, location.search]);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
+  useEffect(() => {
+    if (!receiveVariantId || products.loading || locations.loading || location.search === openedReceiptQuery) return;
+    setOpenedReceiptQuery(location.search);
+    if (products.error || locations.error) { setError(products.error || locations.error); return; }
+    const variant = products.data?.items.flatMap((product) => product.variants).find((variant) => variant.id === receiveVariantId);
+    const locationId = receiptQuery.get("locationId") ?? "main";
+    if (!variant || !locations.data?.items.some((entry) => entry.id === locationId)) {
+      setError("The requested stock receipt variant or location was not found."); return;
+    }
+    setModal("in");
+  }, [receiveVariantId, products.loading, products.data, products.error, locations.loading, locations.data, locations.error, location.search, openedReceiptQuery]);
   const refresh = () => { stock.reload(); batches.reload(); };
   const onSubmit = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault(); setMessage(""); setError("");
@@ -629,7 +698,6 @@ function InventoryPage(): React.JSX.Element {
   };
   const rows = stock.data?.items ?? [];
   const lowCount = rows.filter((row) => Number(row.quantityOnHand) <= Number(row.reorderPoint)).length;
-  const products = useLoad<{ items: Product[] }>("/products");
   const catalog = products.data?.items ?? [];
   const availableProducts = createdProduct && !catalog.some((product) => product.id === createdProduct.id) ? [...catalog, createdProduct] : catalog;
   const variants = availableProducts.flatMap((product) => product.variants.map((variant) => ({ ...variant, productName: product.name })));
@@ -641,11 +709,14 @@ function InventoryPage(): React.JSX.Element {
       }
       const unitCostMinor = Math.round(Number(newProduct.unitCost) * 100);
       if (!Number.isSafeInteger(unitCostMinor) || unitCostMinor < 0) throw new Error("Enter a valid non-negative unit cost.");
+      const sellingPriceMinor = newProduct.sellingPrice.trim() === "" ? null : Math.round(Number(newProduct.sellingPrice) * 100);
+      if (sellingPriceMinor !== null && (!Number.isSafeInteger(sellingPriceMinor) || sellingPriceMinor < 0)) throw new Error("Enter a valid non-negative selling price.");
       const product = await api<Product>("/products", { method: "POST", body: JSON.stringify({
         name: newProduct.name,
         variants: [{
           name: newProduct.variantName, uom: newProduct.uom, sku: newProduct.sku.trim() || undefined, description: newProduct.description || undefined,
           unitCostMinor, currency: newProduct.currency,
+          sellingPriceMinor,
         }],
       }) });
       setCreatedProduct(product);
@@ -672,7 +743,7 @@ function InventoryPage(): React.JSX.Element {
         { label: "LOCATION", render: (row) => String(row.locationName) },
         { label: "ON HAND", render: (row) => <strong>{String(row.quantityOnHand)} <small className="muted">{String(row.uom)}</small></strong> },
         { label: "RESERVED / AVAILABLE", render: (row) => `${row.quantityReserved} / ${row.quantityAvailable} ${row.uom}` },
-        { label: "REORDER AT", render: (row) => `${row.reorderPoint} ${row.uom}` },
+        { label: "MINIMUM / MEDIUM / MAXIMUM", render: (row) => `${row.reorderPoint} / ${row.mediumStockLevel ?? "Not set"} / ${row.maximumStockLevel ?? "Not set"} ${row.uom}` },
         { label: "STATUS", render: (row) => Number(row.quantityOnHand) === 0 ? <StatusPill status="Out of stock" /> : Number(row.quantityOnHand) <= Number(row.reorderPoint) ? <StatusPill status="Low stock" /> : <StatusPill status="In stock" /> },
         { label: "VALUE", className: "align-right", render: (row) => money(Number(row.quantityOnHand) * Number(row.unitCostMinor), String(row.currency)) },
       ]} /> : tab === "batches" ? <DataTable rowKey="batchId" rows={batches.data?.items ?? []} empty="Each stock-in creates a traceable batch, complete with lot and receipt cost." columns={[
@@ -705,6 +776,7 @@ function InventoryPage(): React.JSX.Element {
           <UomField value={newProduct.uom} onChange={(uom) => setNewProduct((current) => ({ ...current, uom }))} locked={savingProduct} />
           <label className="field-label">SKU <span className="field-optional">AUTOMATIC IF BLANK</span><input maxLength={100} placeholder="Generated when you save the product" value={newProduct.sku} onChange={updateNewProduct("sku")} disabled={savingProduct} /></label>
           <label className="field-label">Catalog unit cost<input type="number" min="0" step="0.01" value={newProduct.unitCost} onChange={updateNewProduct("unitCost")} disabled={savingProduct} /></label>
+          <label className="field-label">Selling price per UOM <span className="field-optional">OPTIONAL</span><input type="number" min="0" step="0.01" value={newProduct.sellingPrice} onChange={updateNewProduct("sellingPrice")} disabled={savingProduct} /><small>Default price for orders and checkout offers.</small></label>
           <label className="field-label">Currency<select value={newProduct.currency} onChange={updateNewProduct("currency")} disabled={savingProduct}>{["PHP", "USD", "SGD", "AUD", "EUR", "GBP"].map((currency) => <option key={currency}>{currency}</option>)}</select></label>
           <label className="field-label field-span">Catalog variant description <span className="field-optional">OPTIONAL</span><textarea rows={2} maxLength={2000} value={newProduct.description} onChange={updateNewProduct("description")} disabled={savingProduct} /></label>
           <small className="field-span">Saving creates a catalog product with its first variant. It does not add stock yet.</small>
@@ -719,8 +791,8 @@ function InventoryPage(): React.JSX.Element {
         {modal === "transfer" ? <>
           <label className="field-label">From<select name="locationId" required>{locations.data?.items.map((location) => <option key={String(location.id)} value={String(location.id)}>{String(location.name)}</option>)}</select></label>
           <label className="field-label">To<select name="destinationLocationId" required><option value="">Choose destination</option>{locations.data?.items.map((location) => <option key={String(location.id)} value={String(location.id)}>{String(location.name)}</option>)}</select></label>
-        </> : <label className="field-label">Location<select name="locationId">{locations.data?.items.map((location) => <option key={String(location.id)} value={String(location.id)}>{String(location.name)}</option>)}</select></label>}
-        {modal === "adjust" ? <label className="field-label">Counted quantity<input type="number" name="countedQuantity" min="0" step="1" required /></label> : <label className="field-label">Quantity<input type="number" name="quantity" min="1" step="1" required /></label>}
+        </> : <label className="field-label">Location<select name="locationId" defaultValue={modal === "in" && receiveVariantId ? receiptQuery.get("locationId") ?? "main" : undefined}>{locations.data?.items.map((location) => <option key={String(location.id)} value={String(location.id)}>{String(location.name)}</option>)}</select></label>}
+        {modal === "adjust" ? <label className="field-label">Counted quantity<input type="number" name="countedQuantity" min="0" step="1" required /></label> : <label className="field-label">Quantity<input type="number" name="quantity" min="1" step="1" required defaultValue={modal === "in" && receiveVariantId && Number.isSafeInteger(Number(receiptQuery.get("quantity"))) && Number(receiptQuery.get("quantity")) > 0 ? receiptQuery.get("quantity") ?? undefined : undefined} /></label>}
         {modal === "in" && <>
           <label className="field-label">Unit cost<input type="number" name="unitCostMinor" min="0" step="0.01" placeholder="Leave blank to use catalog cost" /></label>
           <label className="field-label">Lot number<input name="lotNumber" maxLength={100} /></label>
@@ -732,6 +804,7 @@ function InventoryPage(): React.JSX.Element {
         <div className="modal-actions"><Button type="button" variant="secondary" disabled={savingProduct} onClick={() => setModal(null)}>Cancel</Button><Button type="submit" disabled={savingProduct || selectedVariantId === "new"}>Confirm movement <ChevronRight size={15} /></Button></div>
       </form>
     </Modal>}
+    {returnOrderId && <Link className="back-link" to={`/orders/${encodeURIComponent(returnOrderId)}`}>Return to order and retry payment verification</Link>}
   </>;
 }
 
