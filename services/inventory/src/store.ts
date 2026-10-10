@@ -213,7 +213,7 @@ export class InventoryStore {
   private readonly database: DatabaseSync;
   private readonly ownsDatabase: boolean;
 
-  constructor(databasePath: string | DatabaseSync) {
+  constructor(databasePath: string | DatabaseSync, private readonly fractionalStock: (variantId: string, uom?: string) => boolean = () => false) {
     if (typeof databasePath === "string" && databasePath !== ":memory:") {
       mkdirSync(dirname(databasePath), { recursive: true });
     }
@@ -558,7 +558,8 @@ export class InventoryStore {
   }
 
   stockIn(input: StockInput, options: { allowInactiveProduct?: boolean } = {}): object {
-    const quantity = positiveInteger(input.quantity, "quantity");
+    const effectiveUom = input.uom === undefined ? undefined : unitOfMeasure(input.uom);
+    const quantity = this.stockQuantity(input.variantId, input.quantity, "quantity", false, effectiveUom);
     const variant = this.inventoryVariant(input.variantId);
     if (Number(variant.active) !== 1 || (Number(variant.product_active) !== 1 && !options.allowInactiveProduct)) {
       throw new InventoryError("Stock cannot be received for an inactive product or variant.", 409);
@@ -576,7 +577,7 @@ export class InventoryStore {
     const note = optionalText(input.note, "note");
     const now = new Date().toISOString();
     const batchId = randomUUID();
-    const totalCostMinor = quantity * unitCostMinor;
+    const totalCostMinor = Math.round(quantity * unitCostMinor);
     if (!Number.isSafeInteger(totalCostMinor)) {
       throw new InventoryError("The inventory value exceeds the supported amount.", 400);
     }
@@ -613,7 +614,7 @@ export class InventoryStore {
   }
 
   stockOut(input: StockOutInput): object {
-    const quantity = positiveInteger(input.quantity, "quantity");
+    const quantity = this.stockQuantity(input.variantId, input.quantity, "quantity");
     const variant = this.inventoryVariant(input.variantId);
     const locationId = this.locationId(input.locationId);
     const now = new Date().toISOString();
@@ -650,7 +651,7 @@ export class InventoryStore {
   }
 
   adjustStock(input: AdjustmentInput): object {
-    const countedQuantity = nonNegativeInteger(input.countedQuantity, "countedQuantity");
+    const countedQuantity = this.stockQuantity(input.variantId, input.countedQuantity, "countedQuantity", true);
     const variant = this.inventoryVariant(input.variantId);
     const locationId = this.locationId(input.locationId);
     const now = new Date().toISOString();
@@ -664,7 +665,7 @@ export class InventoryStore {
       if (countedQuantity < this.reservedQuantity(input.variantId, locationId)) {
         throw new InventoryError("Counted stock cannot be less than reserved stock. Resolve the affected orders first.", 409);
       }
-      difference = countedQuantity - currentQuantity;
+      difference = Number((countedQuantity - currentQuantity).toFixed(6));
       if (difference === 0) {
         throw new InventoryError("countedQuantity matches current stock; no adjustment is needed.", 400);
       }
@@ -679,7 +680,7 @@ export class InventoryStore {
           unitCostMinor: Number(variant.unit_cost_minor),
           now,
         });
-        totalCostMinor = difference * Number(variant.unit_cost_minor);
+        totalCostMinor = Math.round(difference * Number(variant.unit_cost_minor));
         if (!Number.isSafeInteger(totalCostMinor)) {
           throw new InventoryError("The inventory value exceeds the supported amount.", 400);
         }
@@ -720,7 +721,7 @@ export class InventoryStore {
   }
 
   transferStock(input: TransferInput): object {
-    const quantity = positiveInteger(input.quantity, "quantity");
+    const quantity = this.stockQuantity(input.variantId, input.quantity, "quantity");
     const variant = this.inventoryVariant(input.variantId);
     if (input.sourceLocationId === input.destinationLocationId) {
       throw new InventoryError("Source and destination locations must be different.", 400);
@@ -812,9 +813,9 @@ export class InventoryStore {
         v.maximum_stock_level AS maximumStockLevel,
         v.unit_cost_minor AS unitCostMinor,
         v.currency,
-        COALESCE(SUM(b.remaining_quantity), 0) AS quantityOnHand,
+        ROUND(COALESCE(SUM(b.remaining_quantity), 0), 6) AS quantityOnHand,
         COALESCE((SELECT SUM(r.quantity) FROM stock_reservations r WHERE r.variant_id = v.id AND r.location_id = l.id), 0) AS quantityReserved,
-        COALESCE(SUM(b.remaining_quantity), 0) - COALESCE((SELECT SUM(r.quantity) FROM stock_reservations r WHERE r.variant_id = v.id AND r.location_id = l.id), 0) AS quantityAvailable
+        ROUND(COALESCE(SUM(b.remaining_quantity), 0) - COALESCE((SELECT SUM(r.quantity) FROM stock_reservations r WHERE r.variant_id = v.id AND r.location_id = l.id), 0), 6) AS quantityAvailable
       FROM variants v
       JOIN products p ON p.id = v.product_id
       CROSS JOIN locations l
@@ -925,7 +926,7 @@ export class InventoryStore {
         b.expires_at AS expiresAt,
         b.remaining_quantity AS quantityOnHand,
         b.unit_cost_minor AS unitCostMinor,
-        b.remaining_quantity * b.unit_cost_minor AS valueMinor,
+        ROUND(b.remaining_quantity * b.unit_cost_minor) AS valueMinor,
         v.currency,
         b.created_at AS receivedAt
       FROM batches b
@@ -947,8 +948,8 @@ export class InventoryStore {
     return this.database.prepare(`
       SELECT
         v.currency,
-        SUM(b.remaining_quantity * b.unit_cost_minor) AS totalValueMinor,
-        SUM(b.remaining_quantity) AS totalUnits,
+        SUM(ROUND(b.remaining_quantity * b.unit_cost_minor)) AS totalValueMinor,
+        ROUND(SUM(b.remaining_quantity), 6) AS totalUnits,
         COUNT(DISTINCT v.id) AS variantCount
       FROM batches b
       JOIN variants v ON v.id = b.variant_id
@@ -1075,9 +1076,9 @@ export class InventoryStore {
         v.maximum_stock_level AS maximumStockLevel,
         v.unit_cost_minor AS unitCostMinor,
         v.currency,
-        COALESCE(SUM(b.remaining_quantity), 0) AS quantityOnHand,
+        ROUND(COALESCE(SUM(b.remaining_quantity), 0), 6) AS quantityOnHand,
         COALESCE((SELECT SUM(r.quantity) FROM stock_reservations r WHERE r.variant_id = v.id AND r.location_id = l.id), 0) AS quantityReserved,
-        COALESCE(SUM(b.remaining_quantity), 0) - COALESCE((SELECT SUM(r.quantity) FROM stock_reservations r WHERE r.variant_id = v.id AND r.location_id = l.id), 0) AS quantityAvailable
+        ROUND(COALESCE(SUM(b.remaining_quantity), 0) - COALESCE((SELECT SUM(r.quantity) FROM stock_reservations r WHERE r.variant_id = v.id AND r.location_id = l.id), 0), 6) AS quantityAvailable
       FROM variants v
       JOIN products p ON p.id = v.product_id
       JOIN locations l ON l.id = ?
@@ -1096,7 +1097,7 @@ export class InventoryStore {
       SELECT COALESCE(SUM(remaining_quantity), 0) AS quantity
       FROM batches WHERE variant_id = ? AND location_id = ?
     `).get(variantId, locationId);
-    return Number(row?.quantity ?? 0);
+    return Number(Number(row?.quantity ?? 0).toFixed(6));
   }
 
   private reservedQuantity(variantId: string, locationId: string): number {
@@ -1153,8 +1154,9 @@ export class InventoryStore {
       const allocated = Math.min(Number(batch.remaining_quantity), remaining);
       if (allocated > 0) {
         allocations.push({ batch, quantity: allocated });
-        totalCostMinor += allocated * Number(batch.unit_cost_minor);
-        remaining -= allocated;
+        totalCostMinor += Math.round(Number(batch.remaining_quantity) * Number(batch.unit_cost_minor))
+          - Math.round(Number((Number(batch.remaining_quantity) - allocated).toFixed(6)) * Number(batch.unit_cost_minor));
+        remaining = Number((remaining - allocated).toFixed(6));
       }
     }
     if (!Number.isSafeInteger(totalCostMinor)) {
@@ -1169,7 +1171,7 @@ export class InventoryStore {
   private applyDeduction(allocations: { batch: BatchRow; quantity: number }[]): void {
     for (const allocation of allocations) {
       const result = this.database.prepare(`
-        UPDATE batches SET remaining_quantity = remaining_quantity - ?
+        UPDATE batches SET remaining_quantity = ROUND(remaining_quantity - ?, 6)
         WHERE id = ? AND remaining_quantity >= ?
       `).run(allocation.quantity, allocation.batch.id, allocation.quantity);
       if (Number(result.changes) !== 1) {
@@ -1204,6 +1206,15 @@ export class InventoryStore {
       input.now,
     );
     return id;
+  }
+
+  private stockQuantity(variantId: string, value: unknown, field: string, allowZero = false, uom?: string): number {
+    if (!this.fractionalStock(variantId, uom)) return allowZero ? nonNegativeInteger(value, field) : positiveInteger(value, field);
+    if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || (!allowZero && Number(value.toFixed(6)) === 0)
+      || value > 1_000_000_000 || Math.abs(value - Number(value.toFixed(6))) > 1e-10) {
+      throw new InventoryError(`${field} must be ${allowZero ? "non-negative" : "positive"}, at most 1,000,000,000 and use at most six decimal places.`, 400);
+    }
+    return Number(value.toFixed(6));
   }
 
   private insertMovement(input: {

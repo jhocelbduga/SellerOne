@@ -1,5 +1,9 @@
 import { DatabaseSync } from "node:sqlite";
+import { createHash } from "node:crypto";
 import { InventoryError } from "@sellerone/inventory-service";
+
+export const materialUoms = ["kg", "g", "lb", "pc", "ea", "set", "pack", "box", "case", "bundle", "L", "ml", "scoop", "sachet", "bottle", "bag", "tube"] as const;
+export function decimalMaterialUom(uom: string): boolean { return ["kg", "g", "lb", "L", "ml"].includes(uom); }
 
 function quantity(value: unknown, label: string): number {
   if (typeof value !== "number" || !Number.isFinite(value) || value <= 0 || value > 1_000_000_000) {
@@ -30,11 +34,19 @@ export class BomStore {
         CHECK (bom_variant_id <> material_variant_id)
       );
     `);
+    for (const column of ["description", "remarks"]) {
+      if (!db.prepare("PRAGMA table_info(material_bom_components)").all().some((row) => row.name === column)) {
+        db.exec(`ALTER TABLE material_bom_components ADD COLUMN ${column} TEXT NOT NULL DEFAULT ''`);
+      }
+    }
+    db.exec(`CREATE TABLE IF NOT EXISTS product_bom_settings (
+      product_id TEXT PRIMARY KEY REFERENCES products(id), enabled INTEGER NOT NULL CHECK(enabled IN (0,1))
+    )`);
   }
 
   list(): object {
     const variants = this.db.prepare(`
-      SELECT v.id, v.name, v.sku, v.uom, v.active, p.name AS productName, p.active AS productActive,
+      SELECT v.id, v.name, v.sku, v.description, v.uom, v.active, p.id AS productId, p.name AS productName, p.active AS productActive,
         EXISTS (SELECT 1 FROM raw_material_variants r WHERE r.variant_id = v.id) AS isRawMaterial
       FROM variants v JOIN products p ON p.id = v.product_id ORDER BY p.name, v.name, v.id
     `).all().map((row) => ({ ...row, active: Boolean(row.active && row.productActive), isRawMaterial: Boolean(row.isRawMaterial) }));
@@ -44,7 +56,7 @@ export class BomStore {
     `).all().map((bom) => ({
       ...bom,
       components: this.db.prepare(`
-        SELECT material_variant_id AS variantId, quantity, uom
+        SELECT material_variant_id AS variantId, quantity, uom, description, remarks
         FROM material_bom_components WHERE bom_variant_id = ? ORDER BY material_variant_id
       `).all(String(bom.variantId)),
     }));
@@ -70,6 +82,9 @@ export class BomStore {
       }
       this.db.prepare("INSERT OR IGNORE INTO raw_material_variants (variant_id) VALUES (?)").run(id);
     } else {
+      if (this.db.prepare("SELECT 1 FROM batches WHERE variant_id = ? AND remaining_quantity <> CAST(remaining_quantity AS INTEGER)").get(id)) {
+        throw new InventoryError("Reconcile fractional stock to whole units before removing its raw-material classification.", 409);
+      }
       if (this.db.prepare("SELECT 1 FROM material_bom_components WHERE material_variant_id = ?").get(id)) {
         throw new InventoryError("Remove this raw material from its BOMs before clearing its classification.", 409);
       }
@@ -98,7 +113,17 @@ export class BomStore {
       const material = this.variant(row.variantId);
       if (!material.active || !material.productActive || !material.isRawMaterial) throw new InventoryError("Every component must be an active classified raw material.", 400);
       if (row.uom !== material.uom) throw new InventoryError("Component UOM must match the current raw-material UOM. No unit conversion is supported.", 400);
-      return { variantId: row.variantId, quantity: quantity(row.quantity, "Component quantity"), uom: String(material.uom) };
+      const amount = quantity(row.quantity, "Component quantity");
+      const text = (value: unknown, field: string) => {
+        if (value === undefined) return "";
+        if (typeof value !== "string" || value.length > 2000) throw new InventoryError(`${field} must be text of at most 2,000 characters.`, 400);
+        return value.trim();
+      };
+      if (body.standardUoms === true && !materialUoms.some((uom) => uom === material.uom)) throw new InventoryError("Choose a raw material with a supported stock UOM.", 400);
+      const usage = amount / outputQuantity;
+      if (body.standardUoms === true && (Number(usage.toFixed(6)) <= 0 || (!decimalMaterialUom(String(material.uom)) && !Number.isSafeInteger(usage))
+        || Math.abs(usage - Number(usage.toFixed(6))) > 1e-10)) throw new InventoryError("Per-unit usage must use whole quantities for count UOMs and at most six decimals for weight/volume.", 400);
+      return { variantId: row.variantId, quantity: amount, uom: String(material.uom), description: text(row.description, "Component description"), remarks: text(row.remarks, "Remarks") };
     });
     this.db.exec("SAVEPOINT save_material_bom");
     try {
@@ -108,8 +133,8 @@ export class BomStore {
           output_uom = excluded.output_uom, notes = excluded.notes, updated_at = excluded.updated_at
       `).run(id, outputQuantity, String(output.uom), body.notes, new Date().toISOString());
       this.db.prepare("DELETE FROM material_bom_components WHERE bom_variant_id = ?").run(id);
-      const insert = this.db.prepare("INSERT INTO material_bom_components (bom_variant_id, material_variant_id, quantity, uom) VALUES (?, ?, ?, ?)");
-      for (const component of components) insert.run(id, component.variantId, component.quantity, component.uom);
+      const insert = this.db.prepare("INSERT INTO material_bom_components (bom_variant_id, material_variant_id, quantity, uom, description, remarks) VALUES (?, ?, ?, ?, ?, ?)");
+      for (const component of components) insert.run(id, component.variantId, component.quantity, component.uom, component.description, component.remarks);
       this.db.exec("RELEASE save_material_bom");
     } catch (error) {
       this.db.exec("ROLLBACK TO save_material_bom; RELEASE save_material_bom");
@@ -121,5 +146,39 @@ export class BomStore {
     this.variant(id);
     if (!this.db.prepare("SELECT 1 FROM material_boms WHERE variant_id = ?").get(id)) throw new InventoryError("BOM not found.", 404);
     this.db.prepare("DELETE FROM material_boms WHERE variant_id = ?").run(id);
+  }
+
+  product(id: string): object {
+    if (!this.db.prepare("SELECT 1 FROM products WHERE id = ?").get(id)) throw new InventoryError("Product not found.", 404);
+    const data = this.list() as { variants: Record<string, unknown>[]; boms: Record<string, unknown>[] };
+    const outputs = data.variants.filter((v) => v.productId === id);
+    const enabled = Boolean(this.db.prepare("SELECT enabled FROM product_bom_settings WHERE product_id = ?").get(id)?.enabled);
+    const boms = data.boms.filter((b) => outputs.some((v) => v.id === b.variantId));
+    return { enabled, version: createHash("sha256").update(JSON.stringify({ enabled, outputs, boms })).digest("hex"),
+      variants: outputs, materials: data.variants.filter((v) => v.isRawMaterial),
+      boms, uoms: materialUoms };
+  }
+
+  saveProduct(id: string, body: Record<string, unknown>): object {
+    const current = this.product(id) as { version: string };
+    if (body.expectedVersion !== current.version) throw new InventoryError("Product BOM changed. Reload and review before saving.", 409);
+    if (typeof body.enabled !== "boolean") throw new InventoryError("Uses Raw Material BOM must be true or false.", 400);
+    if (!Array.isArray(body.boms)) throw new InventoryError("Supply the variant BOM list.", 400);
+    const outputs = this.db.prepare("SELECT id FROM variants WHERE product_id = ? AND active = 1").all(id).map((r) => String(r.id));
+    const seen = new Set<string>();
+    this.db.exec("SAVEPOINT product_bom_save");
+    try {
+      for (const value of body.boms) {
+        if (!value || typeof value !== "object" || Array.isArray(value)) throw new InventoryError("Invalid variant BOM.", 400);
+        const bom = value as Record<string, unknown>;
+        if (typeof bom.variantId !== "string" || !outputs.includes(bom.variantId) || seen.has(bom.variantId)) throw new InventoryError("BOM variants must be unique and belong to this product.", 400);
+        seen.add(bom.variantId);
+        this.save(bom.variantId, { ...bom, outputQuantity: 1, standardUoms: true });
+      }
+      if (body.enabled && outputs.some((variantId) => !seen.has(variantId))) throw new InventoryError("Define a BOM for every active finished-product variant.", 400);
+      this.db.prepare("INSERT INTO product_bom_settings VALUES (?, ?) ON CONFLICT(product_id) DO UPDATE SET enabled=excluded.enabled").run(id, Number(body.enabled));
+      this.db.exec("RELEASE product_bom_save");
+      return this.product(id);
+    } catch (error) { this.db.exec("ROLLBACK TO product_bom_save; RELEASE product_bom_save"); throw error; }
   }
 }

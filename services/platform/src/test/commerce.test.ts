@@ -106,6 +106,132 @@ before(async () => {
 after(async () => { await stop(); rmSync(directory, { recursive: true, force: true }); });
 
 describe("social commerce platform", () => {
+  it("manages per-variant product BOMs and records atomic decimal FIFO production", async () => {
+    const output = await request("/products", "POST", { name: "BOM finished product", variants: [
+      { name: "Standard", sku: "PRODUCTION-STD", uom: "pc", unitCostMinor: 0, currency: "PHP" },
+      { name: "Large", sku: "PRODUCTION-LG", uom: "pc", unitCostMinor: 0, currency: "PHP" },
+    ] });
+    assert.equal(output.status, 201);
+    const id = String(output.body.id); const variants = output.body.variants as Row[];
+    const variantId = String(variants[0].id);
+    const initial = (await request(`/product-bom/${id}`)).body;
+    assert.equal(initial.enabled, false);
+    assert.deepEqual(initial.boms, []);
+    const quick = async (body: Row) => request(`/product-bom/${id}/materials`, "POST", body);
+    assert.equal((await quick({ name: "", sku: "", uom: "kg", unitCostMinor: 100, currency: "PHP" })).status, 400);
+    assert.equal((await request(`/product-bom/${id}/materials`, "POST", { name: "Denied", sku: "DENIED" }, staffCookie)).status, 403);
+    assert.equal((await quick({ name: "Production Flour", sku: "PRODUCTION-FLOUR", uom: "kg", description: "Food grade flour", unitCostMinor: 101, currency: "PHP" })).status, 201);
+    assert.equal((await quick({ name: "Production Carton", sku: "PRODUCTION-CARTON", uom: "pc", unitCostMinor: 100, currency: "PHP" })).status, 201);
+    assert.equal((await quick({ name: "Duplicate", sku: "PRODUCTION-FLOUR", uom: "kg", unitCostMinor: 100, currency: "PHP" })).status, 409);
+    const data = (await request(`/product-bom/${id}`)).body;
+    const flour = (data.materials as Row[]).find((m) => m.sku === "PRODUCTION-FLOUR")!;
+    const carton = (data.materials as Row[]).find((m) => m.sku === "PRODUCTION-CARTON")!;
+    const boms = variants.map((v) => ({ variantId: v.id, outputUom: "pc", notes: "", components: [
+      { variantId: flour.id, quantity: .25, uom: "kg", description: "Sifted flour", remarks: "Keep dry" },
+      { variantId: carton.id, quantity: 1, uom: "pc", description: "Outer carton", remarks: "" },
+    ] }));
+    const config = { enabled: true, expectedVersion: data.version, boms };
+    assert.equal((await request(`/product-bom/${id}`, "PUT", config, staffCookie)).status, 403);
+    for (const components of [[], [boms[0].components[0], boms[0].components[0]], [{ ...boms[0].components[0], quantity: 0 }],
+      [{ ...boms[0].components[0], uom: "g" }], [{ ...boms[0].components[1], quantity: .5 }], [{ ...boms[0].components[0], quantity: .1234567 }], [{ ...boms[0].components[0], quantity: 1e-12 }]]) {
+      assert.equal((await request(`/product-bom/${id}`, "PUT", { ...config, boms: [{ ...boms[0], components }, boms[1]] })).status, 400);
+    }
+    assert.equal((await request(`/product-bom/${id}`, "PUT", { ...config, boms: [boms[0]] })).status, 400);
+    assert.equal((await request(`/product-bom/${id}`, "PUT", config)).status, 200);
+    assert.equal((await request(`/product-bom/${id}`, "PUT", config)).status, 409);
+    assert.equal(((await request(`/product-bom/${id}`)).body.boms as Row[]).length, 2);
+    for (const amount of [.0000001, .1234567, 1e-12]) assert.equal((await request("/stock/in", "POST", { variantId: flour.id, quantity: amount })).status, 400);
+    assert.equal((await request("/stock/in", "POST", { variantId: carton.id, quantity: .5 })).status, 400);
+    assert.equal((await request("/stock/in", "POST", { variantId: flour.id, quantity: .5, uom: "pc" })).status, 400);
+    assert.equal((await request("/stock/in", "POST", { variantId, quantity: .5 })).status, 400);
+    assert.equal((await request("/stock/in", "POST", { variantId: flour.id, quantity: 1.2 })).status, 201);
+    assert.equal((await request("/stock/in", "POST", { variantId: flour.id, quantity: .8, unitCostMinor: 201 })).status, 201);
+    assert.equal((await request("/stock/in", "POST", { variantId: carton.id, quantity: 10 })).status, 201);
+    const preview = async (quantity: number) => request(`/product-bom/${id}/requirements`, "POST", { variantId, locationId: "main", quantity });
+    assert.equal((await preview(.5)).status, 400);
+    const plan = (await preview(3)).body;
+    assert.equal(plan.canProduce, true);
+    assert.equal((plan.materials as Row[]).find((m) => m.variantId === flour.id)?.required, .75);
+    const transaction = { variantId, locationId: "main", quantity: 3, expectedUpdatedAt: plan.expectedUpdatedAt, requestKey: crypto.randomUUID(), note: "Test assembly", confirmed: true };
+    const roleCookies: Record<string, string> = {};
+    for (const role of ["admin", "inventory_controller", "order_processing_specialist", "customer_relations_representative"]) {
+      const invite = await request("/users", "POST", { name: `Production ${role}`, email: `production-${role}@example.test`, role });
+      assert.equal(invite.status, 201);
+      const token = new URL(String(invite.body.inviteUrl)).searchParams.get("token");
+      const registered = await request("/auth/register", "POST", { token, password: "Production-Test-2026!" }, "");
+      assert.equal(registered.status, 201); roleCookies[role] = registered.cookie;
+    }
+    for (const role of ["admin", "inventory_controller", "order_processing_specialist"]) {
+      assert.equal((await request(`/product-bom/${id}`, "GET", undefined, roleCookies[role])).status, 200);
+      assert.equal((await request(`/product-bom/${id}`, "PUT", config, roleCookies[role])).status, 403);
+    }
+    assert.equal((await request(`/product-bom/${id}`, "GET", undefined, roleCookies.customer_relations_representative)).status, 403);
+    for (const role of ["order_processing_specialist", "customer_relations_representative"]) {
+      assert.equal((await request(`/production/${id}`, "POST", transaction, roleCookies[role])).status, 403);
+    }
+    assert.equal((await request(`/production/${id}`, "POST", { ...transaction, expectedUpdatedAt: "stale" }, roleCookies.admin)).status, 409);
+    assert.equal((await request(`/production/${id}`, "POST", { ...transaction, confirmed: false })).status, 400);
+    assert.equal((await request(`/production/${id}`, "POST", { ...transaction, expectedUpdatedAt: "old" })).status, 409);
+    const triggerDb = new DatabaseSync(databasePath);
+    triggerDb.exec("CREATE TRIGGER production_test_failure BEFORE INSERT ON production_transactions BEGIN SELECT RAISE(ABORT, 'Audit failure'); END;");
+    try {
+      assert.equal((await request(`/production/${id}`, "POST", transaction)).status, 500);
+      assert.equal(Number((await balance(String(flour.id))).quantityOnHand), 2);
+      assert.equal(Number((await balance(variantId)).quantityOnHand), 0);
+    } finally { triggerDb.exec("DROP TRIGGER production_test_failure"); triggerDb.close(); }
+    const produced = await request(`/production/${id}`, "POST", transaction, roleCookies.inventory_controller);
+    assert.equal(produced.status, 201, JSON.stringify(produced.body));
+    assert.equal(produced.body.costMinor, 376);
+    assert.equal(Number((await balance(String(flour.id))).quantityOnHand), 1.25);
+    assert.equal(Number((await balance(String(carton.id))).quantityOnHand), 7);
+    assert.equal(Number((await balance(variantId)).quantityOnHand), 3);
+    assert.equal((await request(`/production/${id}`, "POST", transaction, roleCookies.inventory_controller)).body.duplicate, true);
+    assert.equal(Number((await balance(variantId)).quantityOnHand), 3);
+    assert.equal((await request(`/production/${id}`, "POST", { ...transaction, quantity: 4 }, roleCookies.inventory_controller)).status, 409);
+    const movements = ((await request(`/movements?variantId=${variantId}`)).body.items as Row[]).filter((m) => m.reference === produced.body.id);
+    assert.equal(movements.reduce((total, m) => total + Number(m.totalCostMinor), 0), 376);
+    const shortage = (await preview(10)).body;
+    assert.equal(shortage.canProduce, false);
+    assert.equal((await request(`/production/${id}`, "POST", { ...transaction, quantity: 10, requestKey: crypto.randomUUID() })).status, 409);
+    assert.equal(Number((await balance(String(flour.id))).quantityOnHand), 1.25);
+    const secondPlan = (await preview(2)).body;
+    assert.equal((await request(`/production/${id}`, "POST", { ...transaction, quantity: 2, expectedUpdatedAt: secondPlan.expectedUpdatedAt, requestKey: crypto.randomUUID() }, staffCookie)).body.costMinor, 255);
+    assert.equal(Number((await balance(String(flour.id))).quantityOnHand), .75);
+    const stockConfig = (await request("/inventory-alerts")).body;
+    const rule = { variantId: flour.id, lowEnabled: true, lowThreshold: 1, outEnabled: true, reorderThreshold: null };
+    assert.equal((await request("/inventory-alerts", "PUT", { rules: [...stockConfig.rules as Row[], rule], recipients: { roles: ["owner"], userIds: [] } })).status, 200);
+    assert.ok(((await request("/notifications")).body.items as Row[]).some((n) => n.variantId === flour.id && n.kind === "low_stock"));
+    assert.equal((await request("/stock/out", "POST", { variantId: flour.id, quantity: .75 })).status, 200);
+    assert.equal(Number((await balance(String(flour.id))).quantityOnHand), 0);
+    assert.ok(((await request("/notifications")).body.items as Row[]).some((n) => n.variantId === flour.id && n.kind === "out_of_stock"));
+    assert.equal((await request("/stock/in", "POST", { variantId: flour.id, quantity: .3 })).status, 201);
+    assert.equal((await request("/adjustments", "POST", { variantId: flour.id, countedQuantity: .2 })).status, 200);
+    const destination = await request("/locations", "POST", { name: "Fractional production warehouse" });
+    assert.equal((await request("/transfers", "POST", { variantId: flour.id, sourceLocationId: "main", destinationLocationId: destination.body.id, quantity: .1 })).status, 200);
+    assert.equal(Number((await balance(String(flour.id))).quantityOnHand), .1);
+    const current = (await request(`/product-bom/${id}`)).body;
+    assert.equal((await request(`/product-bom/${id}`, "PUT", { enabled: false, expectedVersion: current.version, boms: [] })).status, 200);
+    assert.equal((await preview(1)).status, 409);
+    const disabled = (await request(`/product-bom/${id}`)).body;
+    assert.equal((disabled.boms as Row[]).length, 2);
+    assert.equal((disabled.transactions as Row[]).length, 2);
+    assert.equal((disabled.transactions as Row[])[1].actorRole, "inventory_controller");
+    assert.equal((disabled.transactions as Row[])[1].currency, "PHP");
+    assert.equal(((disabled.transactions as Row[])[0].materials as Row[])[0].sku !== undefined, true);
+    await stop(); await start();
+    const persisted = (await request(`/product-bom/${id}`)).body;
+    assert.equal(persisted.enabled, false); assert.deepEqual(persisted.transactions, disabled.transactions);
+    assert.equal(Number((await balance(String(flour.id))).quantityOnHand), .1);
+    assert.equal((await request("/inventory-alerts", "PUT", stockConfig)).status, 200);
+    const cleanupDb = new DatabaseSync(databasePath);
+    try {
+      cleanupDb.prepare("DELETE FROM notification_reads WHERE notification_id IN (SELECT id FROM stock_notifications WHERE location_id=?)").run(String(destination.body.id));
+      cleanupDb.prepare("DELETE FROM stock_notifications WHERE location_id=?").run(String(destination.body.id));
+      cleanupDb.prepare("DELETE FROM movements WHERE source_location_id=? OR destination_location_id=?").run(String(destination.body.id), String(destination.body.id));
+      cleanupDb.prepare("DELETE FROM batches WHERE location_id=?").run(String(destination.body.id));
+      cleanupDb.prepare("DELETE FROM locations WHERE id=?").run(String(destination.body.id));
+    } finally { cleanupDb.close(); }
+  });
   it("retires products with confirmed reasons, immutable history and independent stakeholder notifications", async () => {
     const accounts: { role: string; id: string; cookie: string }[] = [];
     for (const role of ["admin", "inventory_controller", "order_processing_specialist"]) {

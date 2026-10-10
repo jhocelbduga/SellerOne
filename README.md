@@ -454,8 +454,9 @@ details. There is no new support-ticket or enquiry integration.
 Existing Staff access is preserved; this change does not convert Staff into a
 restricted role. Owners/Admins retain normal workspace management, but Admins
 cannot assign roles, replace elevated pending invitations, or manage Owner/Admin
-accounts. Payment verification/rejection, refunds, imports, checkout links, and
-BOM editing remain Owner/Admin-only.
+accounts. Payment verification/rejection, refunds, imports and checkout links
+remain Owner/Admin-only. Catalogue and BOM editing are Owner-only; Owners,
+Admins, Staff and Inventory Controllers may record explicit production.
 
 `POST /users` accepts the five invitation roles for Owners; Admins must omit
 `role` and receive Staff invitations. `PATCH /invitations/:email` lets an Owner
@@ -552,7 +553,8 @@ variant prefills its UOM; it can also be defined during its first receipt.
 After any stock movement, UOM is locked even if stock is later depleted.
 Create a new variant to use a different UOM; existing quantities are never
 converted or relabeled. Quantity, counted quantity, and reorder point remain
-whole numbers in that UOM, and unit cost is the cost per UOM.
+whole numbers in that UOM, except classified weight/volume raw materials
+(kg, g, lb, L, ml), which support up to six decimal places. Unit cost is the cost per UOM.
 Stock balances, batches, movement history, and low-stock API listings include
 `uom`; product responses also include `uomLocked`. The inventory and product
 stock summaries group quantities by UOM rather than adding unlike units.
@@ -768,10 +770,11 @@ and blocks its API while retaining saved classifications and BOMs.
 Each active non-material finished-product variant can have one editable,
 single-level BOM: a positive output quantity in its existing UOM, notes, and
 1-100 distinct active raw-material components with positive decimal quantities
-in their own existing UOMs. Quantities are capped at 1,000,000,000. No nested BOMs,
-unit conversion, production, costing, stock deduction, or changes to order
-fulfillment are enabled. Existing recipe attributes are not imported or changed.
-Stock receipts remain whole-number quantities under existing inventory rules.
+in their own existing UOMs. Quantities are capped at 1,000,000,000. This separate
+page edits shared BOM records; it does not itself execute production. No nested
+BOMs, unit conversion or automatic order consumption is supported. Existing
+recipe attributes are not imported or changed. Classified weight/volume
+material stock supports six decimal places; other stock remains whole-number.
 
 Only Owners classify materials and save or delete structures; other authorised roles can view.
 Referenced materials cannot be unclassified until removed from their BOMs, and
@@ -786,6 +789,56 @@ review rather than silently converting quantities.
 | PATCH | `/raw-material-bom/materials/:variantId` | Set `isRawMaterial` boolean |
 | PUT | `/raw-material-bom/:variantId` | Replace BOM with `outputQuantity`, `outputUom`, `notes`, and `components` (`variantId`, `quantity`, `uom`) |
 | DELETE | `/raw-material-bom/:variantId` | Delete only the BOM structure |
+
+### Product Details BOM and Production / Assembly
+
+Product Details includes **Uses Raw Material BOM**, unchecked by default, with
+an Owner-only **Edit Raw Material BOM** action. This product-level configuration
+is independent of the optional workspace navigation setting above and reuses
+the same per-variant BOM records. Enabling requires components for every active
+finished-product variant. Disabling hides components and blocks production while
+retaining recipes and production history. Save or cancel the product-information
+sheet before editing BOM configuration.
+
+The inline component table contains raw-material name, inventory SKU, component
+description, stock UOM, usage per finished unit and optional remarks. Add/remove
+rows, component counts, duplicate detection and live positive-usage validation
+guide completion. Names, SKUs and stock UOM come from linked inventory records.
+Quick-add creates a named/SKU-coded, zero-stock raw material or classifies an
+existing inventory variant; it persists independently of cancelling BOM edits.
+Supported UOMs: kg, g, lb; pc, ea, set; pack, box, case, bundle; L, ml; scoop,
+sachet, bottle, bag, tube. Weight/volume usage supports six decimals; count-based
+usage is whole-number. Historical UOM locks are not bypassed.
+
+**Calculate material requirements** multiplies per-unit usage by the entered
+production/order quantity, compares available (not reserved) stock at the
+selected location, and supplies shortage-receiving links. Owners, Admins, Staff
+and Inventory Controllers can **Record production / assembly** after confirmation.
+The atomic transaction consumes materials by FIFO, records consumption movements,
+receives finished-product stock at the same location, and saves actor, timestamp,
+quantity, material snapshots and costs. Shortages, inactive components, mismatched
+UOM/currency or changed BOMs block production without partial deductions. Production
+quantities are whole numbers from 1 to 1,000,000. Idempotent request keys prevent
+duplicate consumption on retries.
+
+Fractional stock receipts, issues, transfers and reconciliation are supported
+only for classified kg/g/lb/L/ml materials; existing finished-product and
+count-based inventory behaviour is preserved. Quantities are rounded to six
+decimals after arithmetic; currency minor-unit values are rounded per FIFO
+batch remainder. Finished receipts split into at most two cost batches so their
+combined value exactly equals consumed material cost. Existing per-SKU low-stock,
+out-of-stock and recipient settings also monitor raw components and refresh after
+production. Orders do **not** consume raw materials automatically. Nested BOMs,
+automatic replenishment and unit/currency conversion are not implemented.
+
+| Method | API | Purpose |
+| --- | --- | --- |
+| GET | `/product-bom/:productId` | Product toggle, variants, shared components, version and production history |
+| PUT | `/product-bom/:productId` | Owner-only atomic configuration with `enabled`, `expectedVersion` and per-variant `boms` |
+| POST | `/product-bom/:productId/materials` | Owner-only quick-add/classify linked raw-material inventory |
+| POST | `/product-bom/:productId/requirements` | Calculate requirements from `variantId`, `locationId`, `quantity` |
+| POST | `/production/:productId` | Confirmed production with preview version, actor audit and idempotent request key |
+| GET | `/product-bom/material-stock` | Raw-material classifications for inventory quantity validation |
 
 ### Stock planning levels
 

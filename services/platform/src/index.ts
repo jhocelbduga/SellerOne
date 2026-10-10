@@ -11,7 +11,8 @@ import sharp from "sharp";
 import { InventoryError, InventoryStore } from "@sellerone/inventory-service";
 import { CatalogueMetadata } from "./catalogue.js";
 import { CHANNELS, CommerceStore } from "./commerce.js";
-import { BomStore } from "./bom.js";
+import { BomStore, decimalMaterialUom, materialUoms } from "./bom.js";
+import { ProductionStore } from "./production.js";
 import { NotificationStore } from "./notifications.js";
 import { canAccessApi, isRole, migrateWorkspaceRoles, type Role } from "./roles.js";
 
@@ -231,10 +232,14 @@ db.exec(`
 `);
 
 migrateWorkspaceRoles(db);
-const inventory = new InventoryStore(db);
+const inventory = new InventoryStore(db, (id, uom) => {
+  const row = db.prepare("SELECT v.uom FROM variants v JOIN raw_material_variants r ON r.variant_id=v.id WHERE v.id=?").get(id);
+  return !!row && decimalMaterialUom(uom ?? String(row.uom));
+});
 const catalogue = new CatalogueMetadata(db);
 const materialBoms = new BomStore(db);
 const notifications = new NotificationStore(db, inventory);
+const production = new ProductionStore(db, inventory);
 db.exec(`CREATE TABLE IF NOT EXISTS user_profile_pictures (
   user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
   image BLOB NOT NULL,
@@ -678,6 +683,56 @@ async function api(
 
   const user = requireUser(parseUser(request));
   if (!canAccessApi(user.role, path[0], method)) throw new AppError(["products", "variants", "raw-material-bom"].includes(path[0]) && method !== "GET" ? "Only Workspace Owners can modify catalogue records." : "Your workspace role does not have access to this resource.", 403);
+  if (path[0] === "product-bom" && path.length >= 2) {
+    if (path.length === 2 && path[1] === "material-stock" && method === "GET") {
+      sendJson(response, 200, { items: db.prepare("SELECT r.variant_id AS variantId, v.uom FROM raw_material_variants r JOIN variants v ON v.id=r.variant_id").all() }); return;
+    }
+    if (path.length === 2 && method === "GET") { sendJson(response, 200, { ...materialBoms.product(path[1]), transactions: production.history(path[1]) }); return; }
+    if (path.length === 2 && method === "PUT") {
+      const body = await readBody(request);
+      if (parseUser(request)?.role !== "owner") throw new AppError("Only Workspace Owners can manage product BOMs.", 403);
+      sendJson(response, 200, materialBoms.saveProduct(path[1], body)); return;
+    }
+    if (path.length === 3 && path[2] === "materials" && method === "POST") {
+      const body = await readBody(request);
+      if (parseUser(request)?.role !== "owner") throw new AppError("Only Workspace Owners can manage raw materials.", 403);
+      materialBoms.product(path[1]);
+      db.exec("SAVEPOINT quick_add_material");
+      try {
+        let variantId: string;
+        if (typeof body.variantId === "string") variantId = body.variantId;
+        else {
+          if (typeof body.name !== "string" || !body.name.trim() || typeof body.sku !== "string" || !body.sku.trim()) throw new AppError("Raw Material Name and SKU are required.");
+          if (!materialUoms.some((uom) => uom === body.uom) || typeof body.unitCostMinor !== "number") throw new AppError("Select a supported Stock UOM and supply a valid unit cost.");
+          const material = inventory.createProduct({ name: body.name, variants: [{ name: "Standard", sku: body.sku,
+            uom: String(body.uom ?? ""), description: typeof body.description === "string" ? body.description : "",
+            unitCostMinor: body.unitCostMinor, currency: String(body.currency ?? "") }] }) as { variants: { id: string }[] };
+          variantId = material.variants[0].id;
+        }
+        materialBoms.classify(variantId, true);
+        notifications.sync(); db.exec("RELEASE quick_add_material");
+        sendJson(response, 201, materialBoms.product(path[1])); return;
+      } catch (error) { db.exec("ROLLBACK TO quick_add_material; RELEASE quick_add_material"); throw error; }
+    }
+    if (path.length === 3 && path[2] === "requirements" && method === "POST") {
+      const body = await readBody(request);
+      const current = requireUser(parseUser(request));
+      if (!canAccessApi(current.role, "product-bom", "GET")) throw new AppError("Access denied.", 403);
+      sendJson(response, 200, production.plan(path[1], String(body.variantId ?? ""), body.quantity, String(body.locationId ?? ""))); return;
+    }
+    throw new AppError("Product BOM endpoint not found.", 404);
+  }
+  if (path[0] === "production" && path.length === 2 && method === "POST") {
+    const body = await readBody(request);
+    const actor = requireUser(parseUser(request));
+    if (!canAccessApi(actor.role, "production", "POST")) throw new AppError("Your role cannot record production.", 403);
+    db.exec("SAVEPOINT production_with_alerts");
+    try {
+      const result = production.produce(path[1], body, actor);
+      notifications.sync();
+      db.exec("RELEASE production_with_alerts"); sendJson(response, 201, result); return;
+    } catch (error) { db.exec("ROLLBACK TO production_with_alerts; RELEASE production_with_alerts"); throw error; }
+  }
   if (path[0] === "product-lifecycle" && path.length === 2) {
     if (method === "GET") { sendJson(response, 200, notifications.lifecycle.history(path[1])); return; }
     if (method === "POST") {

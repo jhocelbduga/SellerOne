@@ -726,6 +726,7 @@ function InventoryPage(): React.JSX.Element {
   const { user } = useContext(SessionContext);
   const location = useLocation();
   const products = useLoad<{ items: Product[] }>("/products");
+  const materialStock = useLoad<{ items: { variantId: string; uom: string }[] }>("/product-bom/material-stock");
   const receiptQuery = new URLSearchParams(location.search);
   const receiveVariantId = receiptQuery.get("receive");
   const returnOrderId = receiptQuery.get("orderId");
@@ -788,6 +789,7 @@ function InventoryPage(): React.JSX.Element {
   const catalog = products.data?.items ?? [];
   const availableProducts = createdProduct && !catalog.some((product) => product.id === createdProduct.id) ? [...catalog, createdProduct] : catalog;
   const variants = availableProducts.flatMap((product) => product.variants.map((variant) => ({ ...variant, productName: product.name })));
+  const fractionalQuantity = materialStock.data?.items.some((material) => material.variantId === selectedVariantId) && ["kg", "g", "lb", "L", "ml"].includes(uom);
   const saveNewProduct = async () => {
     setError(""); setSavingProduct(true);
     try {
@@ -879,7 +881,9 @@ function InventoryPage(): React.JSX.Element {
           <label className="field-label">From<select name="locationId" required>{locations.data?.items.map((location) => <option key={String(location.id)} value={String(location.id)}>{String(location.name)}</option>)}</select></label>
           <label className="field-label">To<select name="destinationLocationId" required><option value="">Choose destination</option>{locations.data?.items.map((location) => <option key={String(location.id)} value={String(location.id)}>{String(location.name)}</option>)}</select></label>
         </> : <label className="field-label">Location<select name="locationId" defaultValue={modal === "in" && receiveVariantId ? receiptQuery.get("locationId") ?? "main" : undefined}>{locations.data?.items.map((location) => <option key={String(location.id)} value={String(location.id)}>{String(location.name)}</option>)}</select></label>}
-        {modal === "adjust" ? <label className="field-label">Counted quantity<input type="number" name="countedQuantity" min="0" step="1" required /></label> : <label className="field-label">Quantity<input type="number" name="quantity" min="1" step="1" required defaultValue={modal === "in" && receiveVariantId && Number.isSafeInteger(Number(receiptQuery.get("quantity"))) && Number(receiptQuery.get("quantity")) > 0 ? receiptQuery.get("quantity") ?? undefined : undefined} /></label>}
+        {modal === "adjust" ? <label className="field-label">Counted quantity<input type="number" name="countedQuantity" min="0" step={fractionalQuantity ? "0.000001" : "1"} required /></label> : <label className="field-label">Quantity<input type="number" name="quantity" min={fractionalQuantity ? "0.000001" : "1"} step={fractionalQuantity ? "0.000001" : "1"} required defaultValue={modal === "in" && receiveVariantId && Number.isFinite(Number(receiptQuery.get("quantity"))) && Number(receiptQuery.get("quantity")) > 0 ? receiptQuery.get("quantity") ?? undefined : undefined} /></label>}
+        {fractionalQuantity && <small>Classified weight/volume raw material: up to six decimal places are supported.</small>}
+        {materialStock.error && <p className="error-box" role="alert">{materialStock.error}<button type="button" onClick={materialStock.reload}>Retry material stock settings</button></p>}
         {modal === "in" && <>
           <label className="field-label">Unit cost<input type="number" name="unitCostMinor" min="0" step="0.01" placeholder="Leave blank to use catalog cost" /></label>
           <label className="field-label">Lot number<input name="lotNumber" maxLength={100} /></label>
@@ -888,7 +892,7 @@ function InventoryPage(): React.JSX.Element {
         <label className="field-label">Reference or note <span className="field-optional">OPTIONAL</span><input name="reference" maxLength={200} placeholder="Purchase order, reason, or note" /></label>
         {error && <div className="error-box" role="alert">{error}</div>}
         {message && <div className="success-box" role="status">{message}</div>}
-        <div className="modal-actions"><Button type="button" variant="secondary" disabled={savingProduct} onClick={() => setModal(null)}>Cancel</Button><Button type="submit" disabled={savingProduct || selectedVariantId === "new"}>Confirm movement <ChevronRight size={15} /></Button></div>
+        <div className="modal-actions"><Button type="button" variant="secondary" disabled={savingProduct} onClick={() => setModal(null)}>Cancel</Button><Button type="submit" disabled={savingProduct || selectedVariantId === "new" || materialStock.loading || !!materialStock.error}>Confirm movement <ChevronRight size={15} /></Button></div>
       </form>
     </Modal>}
     {returnOrderId && <Link className="back-link" to={`/orders/${encodeURIComponent(returnOrderId)}`}>Return to order and retry payment verification</Link>}

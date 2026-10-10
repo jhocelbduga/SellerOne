@@ -10,6 +10,8 @@ export function isAdmin(role: Role): boolean {
 }
 
 export function canAccessApi(role: Role, resource: string, method: string): boolean {
+  if (resource === "product-bom") return method === "GET" || method === "POST" ? canAccessApi(role, "products", "GET") : role === "owner";
+  if (resource === "production") return method === "POST" && ["owner", "admin", "staff", "inventory_controller"].includes(role);
   if (resource === "product-lifecycle") return method === "GET" ? canAccessApi(role, "products", "GET") : isAdmin(role);
   if (["products", "variants", "raw-material-bom"].includes(resource) && method !== "GET") return role === "owner";
   if (resource === "product-images") return canAccessApi(role, "products", "GET") && method === "GET";

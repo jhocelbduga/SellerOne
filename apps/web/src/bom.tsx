@@ -8,14 +8,14 @@ interface MaterialVariant {
   active: boolean; isRawMaterial: boolean;
 }
 interface Component {
-  variantId: string; quantity: number; uom: string;
+  variantId: string; quantity: number; uom: string; description?: string; remarks?: string;
 }
 interface Bom {
   variantId: string; outputQuantity: number; outputUom: string;
   notes: string; updatedAt: string; components: Component[];
 }
 interface BomData { variants: MaterialVariant[]; boms: Bom[] }
-interface DraftComponent { key: number; variantId: string; quantity: string; uom: string }
+interface DraftComponent { key: number; variantId: string; quantity: string; uom: string; description?: string; remarks?: string }
 
 export function RawMaterialBomPage({ enabled, role }: { enabled: boolean; role: Role }): React.JSX.Element {
   const { data, loading, error, reload } = useLoad<BomData>(enabled ? "/raw-material-bom" : "");
@@ -62,13 +62,13 @@ export function RawMaterialBomPage({ enabled, role }: { enabled: boolean; role: 
     if (!output || busy) return;
     void mutate(`/raw-material-bom/${selected}`, "PUT", {
       outputQuantity: Number(outputQuantity), outputUom, notes,
-      components: components.map((entry) => ({ variantId: entry.variantId, quantity: Number(entry.quantity), uom: entry.uom })),
+      components: components.map((entry) => ({ variantId: entry.variantId, quantity: Number(entry.quantity), uom: entry.uom, description: entry.description, remarks: entry.remarks })),
     }, "BOM saved. Catalog, stock, and orders were not changed.");
   };
   if (!enabled) return <section className="panel form-panel"><h1>Raw Material BOM</h1><p>This optional view is disabled. Saved classifications and BOMs are retained.</p>{isAdmin(role) ? <Link to="/settings#preferences">Enable in Settings preferences</Link> : <p>Ask an owner or admin to enable it.</p>}<p>The standard Product catalogue remains available.</p><Link to="/products">View products</Link></section>;
   return <>
     <div className="page-heading"><div><span className="page-eyebrow">MATERIAL PLANNING</span><h1>Raw Material BOM</h1><p>Classify raw materials and define a single-level bill of materials for each finished-product variant.</p></div></div>
-    <p>Optional planning view only. Product listings, recipe attributes, stock receipts, reservations, and order fulfillment are unchanged. Decimal BOM quantities use the exact displayed UOM; no unit conversion or automatic deduction is performed.</p>
+    <p>Optional planning view. Decimal BOM quantities use the exact displayed UOM; no unit conversion or automatic order deduction is performed. Enable product BOMs and record explicit production in Product Details to consume raw materials and receive finished stock.</p>
     {!canEdit && <p>Read-only access. Only Workspace Owners manage classifications and BOMs.</p>}
     {error && <div className="error-box" role="alert">{error}</div>}
     {problem && <div className="error-box" role="alert">{problem}</div>}

@@ -89,6 +89,18 @@ button { color: inherit; }
 .catalogue-menu-items > button:disabled { opacity: .45; cursor: not-allowed; }
 .catalogue-menu-items > .catalogue-menu-danger { color: #a23c32; }
 .catalogue-menu-divider { height: 1px; margin: 5px; background: #e6e6e6; }
+.product-bom-panel { margin: 20px 0; }
+.product-bom-panel a { text-decoration: none; color: #464feb; }
+.product-bom-panel th, .product-bom-panel td { border: 1px solid #e6e6e6; }
+.product-bom-panel th { background: #f5f5f5; }
+.product-bom-panel .table-scroll { margin: 14px 0; }
+.product-bom-panel td input, .product-bom-panel td select { min-width: 140px; width: 100%; }
+.product-bom-panel td .field-error { display: block; max-width: 220px; margin-top: 5px; }
+.bom-toggle { display: flex; align-items: center; gap: 10px; font-weight: 700; margin: 15px 0; }
+.bom-toggle input { width: 18px; height: 18px; }
+.bom-variant, .bom-production, .bom-quick-add { padding: 14px 0; border-top: 1px solid #e6e6e6; margin-top: 14px; }
+.product-bom-panel summary { cursor: pointer; padding: 14px 0; font-weight: 700; }
+.product-bom-panel li { overflow-wrap: anywhere; margin-bottom: 12px; }
 .order-form-section { min-width: 0; margin: 0; padding: 16px; border: 1px solid #e8ece7; border-radius: 10px; }
 .order-form-section legend { padding: 0 7px; font-weight: 700; }
 .order-form-section > .field-label, .order-form-section > .form-grid { margin-bottom: 14px; }

@@ -3,6 +3,7 @@ import { useLocation, useNavigate, useParams } from "react-router-dom";
 import { api, useLoad } from "./api";
 import type { Role } from "./roles";
 import { ProductLifecycleControls, lifecycleLabel } from "./product-lifecycle";
+import { ProductBom } from "./product-bom";
 
 interface Variant {
   id: string; name: string; description?: string | null; sku: string; barcode?: string | null;
@@ -212,6 +213,8 @@ function ProductSheetEditor({ id, role, userId }: { id?: string; role: Role; use
       {owner && editing && <div className="form-actions"><button type="button" className="button button-secondary" disabled={busy || imageBusy} onClick={() => { if (discard()) { setEditing(false); if (!id) { leaveAllowed.current = true; navigate("/products"); } } }}>Cancel Changes</button><button type="button" className="button button-secondary" disabled={busy || imageBusy} onClick={discard}>Reset</button><button type="submit" className="button button-primary" disabled={busy || imageBusy || catalogue.loading || !!catalogue.error || !!Object.keys(issues).length || !dirty}>{busy ? "Saving..." : "Save Changes"}</button></div>}
       {busy && <p role="status">Saving product information...</p>}
     </form>
+    {id && !editing && <ProductBom productId={id} role={role} onStockChanged={() => { stock.reload(); existing.reload(); }} />}
+    {editing && <p>Save or cancel product information edits to configure raw-material BOMs and record production in Product Details.</p>}
     {id && !editing && existing.data && <section className="panel"><h2>Product lifecycle management</h2><ProductLifecycleControls productId={id} productName={existing.data.name} status={existing.data.lifecycleStatus} role={role} history onChanged={() => { setNotice("Product lifecycle updated. Audit history and stakeholder notifications recorded."); setReady(false); existing.reload(); stock.reload(); }} /></section>}
     {id && editing && <p>Save or cancel product edits to manage lifecycle status and view its audit history.</p>}
   </>;
