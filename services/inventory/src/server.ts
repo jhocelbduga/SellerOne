@@ -90,6 +90,7 @@ function optionalAttributes(body: Record<string, unknown>): Record<string, strin
 function parseVariantInput(body: Record<string, unknown>): VariantInput {
   return {
     name: requiredString(body, "name"),
+    description: optionalString(body, "description") ?? undefined,
     sku: requiredString(body, "sku"),
     barcode: optionalString(body, "barcode", true) ?? undefined,
     attributes: optionalAttributes(body),
@@ -121,6 +122,7 @@ function parseProductPatch(body: Record<string, unknown>): ProductPatch {
 function parseVariantPatch(body: Record<string, unknown>): VariantPatch {
   return {
     name: optionalString(body, "name") ?? undefined,
+    description: optionalString(body, "description", true),
     sku: optionalString(body, "sku") ?? undefined,
     barcode: optionalString(body, "barcode", true),
     attributes: optionalAttributes(body),

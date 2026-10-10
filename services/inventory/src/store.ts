@@ -15,6 +15,7 @@ export class InventoryError extends Error {
 
 export interface VariantInput {
   name: string;
+  description?: string;
   sku: string;
   barcode?: string;
   attributes?: Record<string, string>;
@@ -37,6 +38,7 @@ export interface ProductPatch {
 
 export interface VariantPatch {
   name?: string;
+  description?: string | null;
   sku?: string;
   barcode?: string | null;
   attributes?: Record<string, string>;
@@ -170,6 +172,7 @@ function stringAttributes(value: unknown): Record<string, string> {
 function validateVariant(input: VariantInput): VariantInput {
   return {
     name: requiredText(input.name, "variant name"),
+    description: optionalText(input.description, "variant description", 2000) ?? undefined,
     sku: requiredText(input.sku, "SKU", 100),
     barcode: optionalText(input.barcode, "barcode", 100) ?? undefined,
     attributes: stringAttributes(input.attributes),
@@ -210,6 +213,7 @@ export class InventoryStore {
         id TEXT PRIMARY KEY,
         product_id TEXT NOT NULL REFERENCES products(id),
         name TEXT NOT NULL,
+        description TEXT,
         sku TEXT NOT NULL UNIQUE,
         barcode TEXT UNIQUE,
         attributes_json TEXT NOT NULL,
@@ -226,6 +230,7 @@ export class InventoryStore {
         id TEXT NOT NULL UNIQUE,
         variant_id TEXT NOT NULL REFERENCES variants(id),
         location_id TEXT NOT NULL REFERENCES locations(id),
+        variant_description TEXT,
         lot_number TEXT,
         expires_at TEXT,
         remaining_quantity INTEGER NOT NULL CHECK (remaining_quantity >= 0),
@@ -258,6 +263,8 @@ export class InventoryStore {
       CREATE INDEX IF NOT EXISTS movements_variant_history
         ON movements (variant_id, sequence DESC);
     `);
+    this.ensureColumn("variants", "description", "TEXT");
+    this.ensureColumn("batches", "variant_description", "TEXT");
     this.database.prepare(`
       INSERT OR IGNORE INTO locations (id, name, created_at)
       VALUES (?, ?, ?)
@@ -274,9 +281,12 @@ export class InventoryStore {
       ? this.database.prepare(`
         SELECT id, name, description, active, created_at AS createdAt, updated_at AS updatedAt
         FROM products
-        WHERE name LIKE ? OR description LIKE ?
+        WHERE name LIKE ? OR description LIKE ? OR EXISTS (
+          SELECT 1 FROM variants v
+          WHERE v.product_id = products.id AND v.description LIKE ?
+        )
         ORDER BY name, id
-      `).all(`%${query}%`, `%${query}%`)
+      `).all(`%${query}%`, `%${query}%`, `%${query}%`)
       : this.database.prepare(`
         SELECT id, name, description, active, created_at AS createdAt, updated_at AS updatedAt
         FROM products
@@ -363,6 +373,10 @@ export class InventoryStore {
     if (patch.name !== undefined) {
       fields.push("name = ?");
       values.push(requiredText(patch.name, "name"));
+    }
+    if (patch.description !== undefined) {
+      fields.push("description = ?");
+      values.push(optionalText(patch.description, "variant description", 2000));
     }
     if (patch.sku !== undefined) {
       fields.push("sku = ?");
@@ -457,6 +471,7 @@ export class InventoryStore {
     const unitCostMinor = input.unitCostMinor === undefined
       ? Number(variant.unit_cost_minor)
       : nonNegativeInteger(input.unitCostMinor, "unitCostMinor");
+    const variantDescription = typeof variant.description === "string" ? variant.description : null;
     const lotNumber = optionalText(input.lotNumber, "lotNumber", 100);
     const expiresAt = dateOnly(input.expiresAt, "expiresAt");
     const reference = optionalText(input.reference, "reference", 200);
@@ -471,10 +486,10 @@ export class InventoryStore {
     this.transaction(() => {
       this.database.prepare(`
         INSERT INTO batches (
-          id, variant_id, location_id, lot_number, expires_at,
+          id, variant_id, location_id, variant_description, lot_number, expires_at,
           remaining_quantity, unit_cost_minor, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(batchId, input.variantId, locationId, lotNumber, expiresAt, quantity, unitCostMinor, now);
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(batchId, input.variantId, locationId, variantDescription ?? "", lotNumber, expiresAt, quantity, unitCostMinor, now);
       this.insertMovement({
         variantId: input.variantId,
         type: "stock_in",
@@ -677,6 +692,7 @@ export class InventoryStore {
         p.id AS productId,
         p.name AS productName,
         v.name AS variantName,
+        v.description AS variantDescription,
         v.sku,
         v.barcode,
         l.id AS locationId,
@@ -715,6 +731,7 @@ export class InventoryStore {
         m.variant_id AS variantId,
         p.name AS productName,
         v.name AS variantName,
+        COALESCE(b.variant_description, v.description) AS variantDescription,
         v.sku,
         m.movement_type AS type,
         m.quantity,
@@ -784,6 +801,7 @@ export class InventoryStore {
         b.variant_id AS variantId,
         p.name AS productName,
         v.name AS variantName,
+        COALESCE(b.variant_description, v.description) AS variantDescription,
         v.sku,
         b.location_id AS locationId,
         l.name AS locationName,
@@ -835,7 +853,7 @@ export class InventoryStore {
     }
     const variants = this.database.prepare(`
       SELECT
-        id, name, sku, barcode,
+        id, name, description, sku, barcode,
         attributes_json AS attributesJson,
         unit_cost_minor AS unitCostMinor,
         currency,
@@ -860,13 +878,14 @@ export class InventoryStore {
   private insertVariant(productId: string, variant: VariantInput, now: string): void {
     this.database.prepare(`
       INSERT INTO variants (
-        id, product_id, name, sku, barcode, attributes_json,
+        id, product_id, name, description, sku, barcode, attributes_json,
         unit_cost_minor, currency, reorder_point, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       randomUUID(),
       productId,
       variant.name,
+      variant.description ?? null,
       variant.sku,
       variant.barcode ?? null,
       JSON.stringify(variant.attributes ?? {}),
@@ -880,7 +899,7 @@ export class InventoryStore {
 
   private inventoryVariant(id: string): Record<string, unknown> {
     const variant = this.database.prepare(`
-      SELECT v.id, v.unit_cost_minor, v.currency, v.active, p.active AS product_active
+      SELECT v.id, v.description, v.unit_cost_minor, v.currency, v.active, p.active AS product_active
       FROM variants v
       JOIN products p ON p.id = v.product_id
       WHERE v.id = ?
@@ -900,6 +919,13 @@ export class InventoryStore {
     return locationId;
   }
 
+  private ensureColumn(table: "variants" | "batches", column: string, definition: string): void {
+    const columns = this.database.prepare(`PRAGMA table_info(${table})`).all();
+    if (!columns.some((entry) => entry.name === column)) {
+      this.database.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+    }
+  }
+
   private getStockItem(variantId: string, locationId: string): object {
     const row = this.database.prepare(`
       SELECT
@@ -907,6 +933,7 @@ export class InventoryStore {
         p.id AS productId,
         p.name AS productName,
         v.name AS variantName,
+        v.description AS variantDescription,
         v.sku,
         v.barcode,
         l.id AS locationId,

@@ -320,6 +320,11 @@ response bodies use integer quantities. Monetary values are integer minor units
 Valuation uses FIFO by receipt cost, and stock cannot be reduced below zero.
 The standalone inventory service does not authenticate callers; keep it on a
 trusted internal network and use the platform API for authenticated UI access.
+Variants can have an optional description (up to 2,000 characters). The
+description appears when choosing a variant for stock-in and in stock, batch,
+and movement listings. Each receipt stores a description snapshot so later
+catalog edits do not rewrite its historical identification. Existing SQLite
+databases are migrated automatically when the inventory store starts.
 
 | Method | Endpoint | Purpose |
 | --- | --- | --- |
@@ -350,6 +355,7 @@ Create a product:
   "variants": [
     {
       "name": "250 g",
+      "description": "Resealable pouch, dark roast",
       "sku": "COFFEE-250",
       "barcode": "1000000000250",
       "attributes": { "size": "250 g", "colour": "Dark roast" },

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import type { AddressInfo } from "node:net";
@@ -44,12 +45,13 @@ async function request(
   };
 }
 
-async function createProduct(reorderPoint = 0): Promise<{ productId: string; variantId: string }> {
+async function createProduct(reorderPoint = 0, description?: string): Promise<{ productId: string; variantId: string }> {
   const response = await request("/products", "POST", {
     name: "Coffee Beans",
     description: "Roasted coffee",
     variants: [{
       name: "250 g",
+      description,
       sku: "TEST-COFFEE",
       barcode: null,
       attributes: { size: "250 g" },
@@ -76,6 +78,7 @@ describe("inventory service", () => {
       name: "Coffee Beans",
       variants: [{
         name: "250 g",
+        description: "Resealable coffee pouch",
         sku: "COFFEE-250",
         barcode: "1000000000250",
         attributes: { size: "250 g", colour: "Dark roast" },
@@ -92,6 +95,8 @@ describe("inventory service", () => {
 
     const search = await request("/products?search=Coffee");
     assert.equal((search.body.items as JsonObject[]).length, 1);
+    const variantDescriptionSearch = await request("/products?search=Resealable");
+    assert.equal((variantDescriptionSearch.body.items as JsonObject[]).length, 1);
     const lookup = await request("/products/lookup?code=1000000000250");
     assert.equal(lookup.body.id, created.body.id);
 
@@ -108,7 +113,7 @@ describe("inventory service", () => {
   });
 
   it("tracks stock receipts, FIFO costs, batch allocations, and movement history", async () => {
-    const { variantId } = await createProduct();
+    const { productId, variantId } = await createProduct(0, "Resealable 250 g pouch");
     const firstReceipt = await request("/stock/in", "POST", {
       variantId,
       quantity: 5,
@@ -124,6 +129,11 @@ describe("inventory service", () => {
     });
     assert.equal(firstReceipt.status, 201);
     assert.equal(secondReceipt.status, 201);
+    const descriptionUpdate = await request(`/variants/${variantId}`, "PATCH", {
+      description: "Updated packaging details",
+    });
+    assert.equal(descriptionUpdate.status, 200);
+    assert.equal((descriptionUpdate.body.variants as JsonObject[])[0].description, "Updated packaging details");
 
     const issue = await request("/stock/out", "POST", { variantId, quantity: 7 });
     assert.equal(issue.status, 200);
@@ -139,6 +149,7 @@ describe("inventory service", () => {
     });
 
     const batches = await request(`/batches?variantId=${variantId}`);
+    assert.equal((batches.body.items as JsonObject[])[0].variantDescription, "Resealable 250 g pouch");
     assert.deepEqual((batches.body.items as JsonObject[]).map(({ lotNumber, quantityOnHand, valueMinor }) => ({
       lotNumber,
       quantityOnHand,
@@ -151,6 +162,8 @@ describe("inventory service", () => {
     const items = movements.body.items as JsonObject[];
     assert.equal(items.length, 3);
     assert.equal(items[0].type, "stock_out");
+    assert.equal(items[0].variantDescription, "Updated packaging details");
+    assert.equal(items[1].variantDescription, "Resealable 250 g pouch");
     assert.equal(items[0].totalCostMinor, 800);
     const allocations = items[0].batchAllocations as JsonObject[];
     assert.deepEqual(allocations.map(({ lotNumber, quantity, unitCostMinor }) => ({
@@ -162,6 +175,30 @@ describe("inventory service", () => {
       { lotNumber: "LOT-B", quantity: 2, unitCostMinor: 150 },
     ]);
     assert.ok(allocations.every(({ batchId }) => typeof batchId === "string"));
+    const product = await request(`/products/${productId}`);
+    assert.equal((product.body.variants as JsonObject[])[0].description, "Updated packaging details");
+  });
+
+  it("migrates existing databases to add variant descriptions", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "sellerone-inventory-migration-"));
+    const databasePath = join(directory, "inventory.sqlite");
+    const initialStore = new InventoryStore(databasePath);
+    initialStore.close();
+    const legacyDatabase = new DatabaseSync(databasePath);
+    legacyDatabase.exec("ALTER TABLE variants DROP COLUMN description; ALTER TABLE batches DROP COLUMN variant_description;");
+    legacyDatabase.close();
+
+    const migratedStore = new InventoryStore(databasePath);
+    try {
+      const product = migratedStore.createProduct({
+        name: "Legacy catalog",
+        variants: [{ name: "Standard", sku: "LEGACY-1", unitCostMinor: 100, currency: "PHP" }],
+      }) as { variants: JsonObject[] };
+      assert.equal(product.variants[0].description, null);
+    } finally {
+      migratedStore.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 
   it("rejects overselling and keeps concurrent stock-outs atomic", async () => {
