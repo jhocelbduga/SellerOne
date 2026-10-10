@@ -18,6 +18,7 @@ import { RawMaterialBomPage } from "./bom";
 import { ProfileSocialLinks, profilePlatforms, type ProfileLinks } from "./profile-social";
 import { ProfilePicture, UserAvatar, initials } from "./profile-picture";
 import { canAccessPage, homePath, isAdmin, roleLabel, workspaceRoles, type Role } from "./roles";
+import { InventoryAlerts } from "./inventory-alerts";
 
 interface User {
   id: string;
@@ -263,6 +264,7 @@ function StockNotifications({ canManageInventory }: { canManageInventory: boolea
     id: string; status: "read" | "unread"; readAt: string | null; createdAt: string;
     variantId: string; locationId: string; productName: string; variantName: string;
     sku: string; locationName: string; quantityOnHand: number; reorderPoint: number; uom: string;
+    kind: "low_stock" | "out_of_stock" | "replenishment"; threshold: number; quantityAvailable: number; quantityReserved: number;
   };
   const { data, loading, error, reload, setData } = useLoad<{ items: Notification[]; unreadCount: number }>("/notifications");
   const [selected, setSelected] = useState<Notification | null>(null);
@@ -331,7 +333,8 @@ function StockNotifications({ canManageInventory }: { canManageInventory: boolea
       {selected && <section className="notification-detail" aria-labelledby="notification-detail-title">
         <h3 ref={detail} tabIndex={-1} id="notification-detail-title">{selected.productName} · {selected.variantName}</h3>
         <p>{selected.sku} · {selected.locationName}</p>
-        <p>{selected.quantityOnHand === 0 ? "Out of stock" : "Low stock"}: {selected.quantityOnHand} {selected.uom} on hand · Minimum: {selected.reorderPoint} {selected.uom}</p>
+        <p>{selected.kind === "out_of_stock" ? "Out of stock" : selected.kind === "replenishment" ? "Replenishment needed" : "Low stock"}: {selected.quantityAvailable} {selected.uom} available · Threshold: {selected.threshold} {selected.uom}</p>
+        <p>On hand: {selected.quantityOnHand} {selected.uom} · Reserved: {selected.quantityReserved} {selected.uom}</p>
         <p>Created: {new Date(selected.createdAt).toLocaleString()}</p>
         <p>Status: Read{selected.readAt ? ` · ${new Date(selected.readAt).toLocaleString()}` : ""}</p>
         <p>Reading acknowledges this notification; it does not resolve the stock shortage.</p>
@@ -343,13 +346,13 @@ function StockNotifications({ canManageInventory }: { canManageInventory: boolea
             <button type="button" className={`notification-item ${item.status}`} disabled={viewing} aria-pressed={selected?.id === item.id} onClick={() => void view(item.id)}>
               <strong>{item.productName} · {item.variantName}</strong>
               <small>{item.sku} · {item.locationName}</small>
-              <span>{item.status === "unread" ? "Unread" : "Read"} · View details</span>
+              <span>{item.kind === "out_of_stock" ? "Out of stock" : item.kind === "replenishment" ? "Replenishment needed" : "Low stock"} · {item.quantityAvailable} {item.uom} available · View details</span>
             </button>
           </li>)}
         </ul></> : <p role="status">No pending unread alerts. Viewed alerts have been cleared from this list; stock shortages may still require attention.</p>}
       {viewing && <p role="status">Opening notification...</p>}
       <div className="notification-actions"><button className="button button-secondary" type="button" disabled={loading || viewing} onClick={() => { setSelected(null); setViewError(""); reload(); }}>Refresh alerts</button>{canManageInventory && <Link className="button" to="/inventory" onClick={() => setOpen(false)}>View inventory</Link>}</div>
-      <small>Only pending unread alerts are listed. Read status is saved per user; refreshing does not acknowledge unread items. A new unread notification is created only after stock recovers above minimum and later becomes low again.</small>
+      <small>Only alerts assigned to you are listed. Read status is saved per user. Alerts recur after recovery; shortages escalate to out-of-stock at zero.</small>
     </section>}
   </div>;
 }
@@ -412,7 +415,7 @@ function ProtectedLayout(): React.JSX.Element {
           <div className="topbar-actions">
             <span className="today-label">{new Intl.DateTimeFormat("en-PH", { weekday: "short", month: "short", day: "numeric" }).format(new Date())}</span>
             <button className="icon-button search-trigger" type="button"><Search size={18} /><span>Search</span><kbd>⌘ K</kbd></button>
-            {user.role !== "customer_relations_representative" && <StockNotifications canManageInventory={canAccessPage(user.role, "/inventory")} />}
+            <StockNotifications canManageInventory={canAccessPage(user.role, "/inventory")} />
             <AccountOptions user={user} avatar onNavigate={() => setMobileNavOpen(false)} />
           </div>
         </header>
@@ -1269,6 +1272,7 @@ function SettingsPage(): React.JSX.Element {
         <div className="form-actions"><Button type="submit" disabled={saving}><ShieldCheck size={16} />{saving ? "Saving..." : "Save settings"}</Button></div>
       </div>
     </form>}
+    {tab === "preferences" && <InventoryAlerts />}
   </>;
 }
 

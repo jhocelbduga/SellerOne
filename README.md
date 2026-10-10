@@ -340,7 +340,9 @@ the team list. Staff and Admin remain available alongside:
 Specialized roles cannot access general dashboards, finance, reports, workspace
 settings, or team management. Each starts on its permitted module. All users
 retain their own account details, password, picture, and personal social links.
-Stock notifications are available only to roles with inventory/order access.
+Stock notifications are delivered only to configured recipient roles/users;
+every signed-in role can open its own assigned notifications, without gaining
+inventory or order permissions.
 Customer relations does not grant order mutations or access to full order
 details. There is no new support-ticket or enquiry integration.
 Existing Staff access is preserved; this change does not convert Staff into a
@@ -360,6 +362,47 @@ SQLite role constraints migrate transactionally, preserving existing users,
 passwords, sessions, invitations, profile data, and foreign-key relationships.
 API authorization enforces restrictions independently of navigation and buttons;
 the standalone inventory service remains internal-only.
+
+### Preferences: Inventory Alerts
+
+Owners and Admins can open **Settings → Preferences → Inventory Alerts** to
+configure low-stock and reorder thresholds per variant/SKU in its existing UOM.
+Thresholds are non-negative whole numbers, evaluated separately at each location
+against **available stock (on hand minus reserved)**, including order reservations.
+Blank low-stock thresholds follow the catalogue minimum; blank reorder thresholds
+disable replenishment alerts. Out-of-stock alerts default on at zero available
+stock; their switch can be configured independently. Reset restores SKU defaults.
+Inactive products/variants are not monitored.
+
+Low-stock alerts trigger at or below their configured threshold. Out-of-stock
+alerts supersede low-stock at zero; replenishment alerts are separate and trigger
+at or below their reorder threshold. Stock mutations, payment reservation,
+shipping, cancellation, and configuration saves synchronize persisted episodes.
+Bell polling (15 seconds), focus, navigation, and local mutations refresh delivery;
+generation is immediate at a platform mutation, not dependent on opening the bell.
+Reading acknowledges an episode. Repeated refreshes do not duplicate it.
+Recovery resolves it; a later recurrence or escalation to zero creates a new
+unread notification. Alerts do not deduct stock or create purchase orders.
+
+Recipient roles and individual active users are combined with **OR**, never
+intersection. Only those recipients can list/view alerts. No selections means
+no delivery; role/user changes take effect on refresh. Removed recipients lose
+access to old details, but read history is preserved. Newly selected recipients
+can receive currently active unread episodes. Defaults preserve prior delivery
+to Owner, Admin, Staff, Inventory Controller, and Order Processing Specialist.
+Customer Relations users may be explicitly selected without gaining module access.
+Delivery is **in-app only**, not email or a live external integration.
+
+`GET /inventory-alerts` reads configuration and editor choices (Owner/Admin).
+`PUT /inventory-alerts` atomically replaces `rules` and `recipients`; each rule has
+`variantId`, `lowEnabled`, `lowThreshold`, `outEnabled`, and `reorderThreshold`.
+Recipients contain `roles` and `userIds` arrays. Invalid values, missing users,
+duplicate SKUs/recipients, or unauthorized saves fail explicitly without
+changing saved configuration. Inventory quantities, prices, and catalogue
+minimum/medium/maximum planning levels are not changed by alert configuration.
+The existing dashboard stock-planning summary continues to use catalogue
+minimum/on-hand levels; the notification bell uses these available-stock rules.
+Categories, overstock alerts, and automatic purchase orders are not included.
 
 The platform and inventory data share `DATABASE_PATH` (default
 `.data/sellerone.sqlite`). Set `DATABASE_PATH` to a persistent writable path for

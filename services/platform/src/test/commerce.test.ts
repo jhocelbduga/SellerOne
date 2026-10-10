@@ -235,7 +235,7 @@ describe("social commerce platform", () => {
     const customer = await request("/customers", "POST", { name: "Relations customer", notes: "Support enquiry" }, relations.cookie);
     assert.equal(customer.status, 201);
     assert.equal((await request(`/customers/${customer.body.id}`, "PATCH", { notes: "Feedback received", phone: "09123456789" }, relations.cookie)).status, 200);
-    for (const path of ["/products", "/stock", "/orders", "/notifications", "/raw-material-bom"]) {
+    for (const path of ["/products", "/stock", "/orders", "/raw-material-bom"]) {
       assert.equal((await request(path, "GET", undefined, relations.cookie)).status, 403, path);
     }
     assert.equal((await request(`/orders/${id}`, "PATCH", { stage: "cancelled" }, relations.cookie)).status, 403);
@@ -419,6 +419,8 @@ describe("social commerce platform", () => {
       { name: "Large", sku: "NOTIFICATION-TEST", uom: "cup", unitCostMinor: 0, currency: "PHP", reorderPoint: 10 },
     ] });
     const variantId = String((created.body.variants as Row[])[0].id);
+    const config = (await request("/inventory-alerts")).body;
+    assert.equal((await request("/inventory-alerts", "PUT", { rules: [...config.rules as Row[], { variantId, lowEnabled: true, lowThreshold: null, outEnabled: false, reorderThreshold: null }], recipients: config.recipients })).status, 200);
     assert.equal((await request("/notifications", "GET", undefined, "")).status, 401);
     const list = (await request("/notifications")).body;
     const items = list.items as Row[];
@@ -471,6 +473,111 @@ describe("social commerce platform", () => {
     assert.equal(((await request("/notifications", "GET", undefined, staffCookie)).body.items as Row[]).find((item) => item.id === again.id)?.status, "unread");
     await request(`/variants/${variantId}`, "PATCH", { active: false });
     assert.ok(!((await request("/notifications")).body.items as Row[]).some((item) => item.variantId === variantId));
+  });
+
+  it("configures available-stock alert thresholds and delivers only to selected roles or users", async () => {
+    const initial = (await request("/inventory-alerts")).body;
+    const variantId = await product(10);
+    const owner = (await request("/me")).body.user as Row;
+    const staff = (await request("/me", "GET", undefined, staffCookie)).body.user as Row;
+    const rule = { variantId, lowEnabled: true, lowThreshold: 8, outEnabled: true, reorderThreshold: 4 };
+    const config = { rules: [...initial.rules as Row[], rule], recipients: { roles: ["staff"], userIds: [] } };
+    const adminCookie = (await request("/auth/login", "POST", { email: "admin@roles.example.test", password: "Roles-Test-2026!" }, "")).cookie;
+    assert.ok(adminCookie);
+    assert.equal((await request("/inventory-alerts", "GET", undefined, "")).status, 401);
+    assert.equal((await request("/inventory-alerts", "GET", undefined, staffCookie)).status, 403);
+    assert.equal((await request("/inventory-alerts", "PUT", config, staffCookie)).status, 403);
+    assert.equal((await request("/inventory-alerts", "PUT", config, adminCookie)).status, 200);
+    const persistedKinds = () => {
+      const db = new DatabaseSync(databasePath, { readOnly: true });
+      try { return db.prepare("SELECT kind FROM stock_notifications WHERE variant_id = ? AND resolved_at IS NULL ORDER BY kind").all(variantId).map((row) => row.kind); }
+      finally { db.close(); }
+    };
+    const alerts = async (cookie = staffCookie) => ((await request("/notifications", "GET", undefined, cookie)).body.items as Row[]).filter((entry) => entry.variantId === variantId);
+    assert.deepEqual(await alerts(), []);
+    const reservedOrder = await order(variantId, 2);
+    const paymentId = await payment(reservedOrder);
+    assert.equal((await request(`/orders/${reservedOrder.id}/verify-payment`, "POST", { paymentId })).status, 200);
+    assert.deepEqual(persistedKinds(), ["low_stock"]);
+    let current = await alerts();
+    assert.equal(current.length, 1);
+    assert.equal(current[0].kind, "low_stock");
+    assert.equal(current[0].quantityAvailable, 8);
+    assert.equal(current[0].quantityOnHand, 10);
+    assert.equal(current[0].quantityReserved, 2);
+    assert.equal(current[0].threshold, 8);
+    assert.deepEqual(await alerts(ownerCookie), []);
+    assert.equal((await request(`/notifications/${current[0].id}/view`, "POST")).status, 403);
+    assert.equal((await request(`/notifications/${current[0].id}/view`, "POST", undefined, staffCookie)).status, 200);
+    const lowId = current[0].id;
+    await request("/stock/out", "POST", { variantId, quantity: 4 });
+    assert.deepEqual(persistedKinds(), ["low_stock", "replenishment"]);
+    current = await alerts();
+    assert.equal(current.length, 1);
+    assert.equal(current[0].kind, "replenishment");
+    assert.equal(current[0].quantityAvailable, 4);
+    assert.equal(current[0].threshold, 4);
+    assert.equal((await request(`/notifications/${current[0].id}/view`, "POST", undefined, staffCookie)).status, 200);
+    await request("/stock/out", "POST", { variantId, quantity: 4 });
+    assert.deepEqual(persistedKinds(), ["out_of_stock", "replenishment"]);
+    current = await alerts();
+    assert.equal(current.length, 1);
+    assert.equal(current[0].kind, "out_of_stock");
+    assert.equal(current[0].quantityOnHand, 2);
+    assert.equal(current[0].quantityAvailable, 0);
+    assert.notEqual(current[0].id, lowId);
+    const outId = current[0].id;
+    assert.equal((await request(`/notifications/${outId}/view`, "POST", undefined, staffCookie)).status, 200);
+    assert.deepEqual(await alerts(), []);
+    for (const malformed of [
+      { ...config, rules: [{ ...rule, lowThreshold: -1 }] },
+      { ...config, rules: [{ ...rule, lowThreshold: 1.5 }] },
+      { ...config, rules: [{ ...rule, reorderThreshold: "4" }] },
+      { ...config, rules: [{ ...rule, lowEnabled: "true" }] },
+      { ...config, rules: [{ ...rule, variantId: "missing" }] },
+      { ...config, rules: [rule, rule] },
+      { ...config, recipients: { roles: ["unknown"], userIds: [] } },
+      { ...config, recipients: { roles: [], userIds: ["missing"] } },
+      { ...config, recipients: { roles: ["owner", "owner"], userIds: [] } },
+    ]) assert.equal((await request("/inventory-alerts", "PUT", malformed)).status, 400);
+    assert.deepEqual((await request("/inventory-alerts")).body.recipients, config.recipients);
+    const targeted = { ...config, recipients: { roles: [], userIds: [String(owner.id)] } };
+    assert.equal((await request("/inventory-alerts", "PUT", targeted)).status, 200);
+    assert.equal((await alerts(ownerCookie)).length, 2);
+    assert.deepEqual(await alerts(), []);
+    assert.equal((await request(`/notifications/${outId}/view`, "POST", undefined, staffCookie)).status, 403);
+    await stop(); await start();
+    ownerCookie = (await request("/auth/login", "POST", { email: "owner@example.test", password: "Commerce-Test-2026!" }, "")).cookie;
+    staffCookie = (await request("/auth/login", "POST", { email: "staff@example.test", password: "Commerce-Staff-2026!" }, "")).cookie;
+    assert.deepEqual((await request("/inventory-alerts")).body.recipients, targeted.recipients);
+    assert.deepEqual(await alerts(), []);
+    assert.equal((await alerts(ownerCookie)).length, 2);
+    const none = { ...config, recipients: { roles: [], userIds: [] } };
+    assert.equal((await request("/inventory-alerts", "PUT", none)).status, 200);
+    assert.deepEqual(await alerts(ownerCookie), []);
+    const relationsCookie = (await request("/auth/login", "POST", { email: "customer_relations_representative@roles.example.test", password: "Roles-Test-2026!" }, "")).cookie;
+    assert.equal((await request("/inventory-alerts", "PUT", { ...config, recipients: { roles: ["customer_relations_representative"], userIds: [] } })).status, 200);
+    assert.equal((await alerts(relationsCookie)).length, 2);
+    assert.equal((await request("/stock", "GET", undefined, relationsCookie)).status, 403);
+    assert.equal((await request("/inventory-alerts", "GET", undefined, relationsCookie)).status, 403);
+    assert.equal((await request("/inventory-alerts", "PUT", { ...config, recipients: { roles: [], userIds: [String(staff.id)] } })).status, 200);
+    assert.deepEqual(await alerts(), []);
+    await request("/stock/in", "POST", { variantId, quantity: 9 });
+    assert.deepEqual(await alerts(), []);
+    await request("/stock/out", "POST", { variantId, quantity: 1 });
+    current = await alerts();
+    assert.equal(current[0].kind, "low_stock");
+    assert.notEqual(current[0].id, lowId);
+    const disabled = { ...config, rules: [...initial.rules as Row[], { ...rule, lowEnabled: false, outEnabled: false, reorderThreshold: null }] };
+    assert.equal((await request("/inventory-alerts", "PUT", disabled)).status, 200);
+    assert.deepEqual(await alerts(), []);
+    const catalog = (await request("/products")).body;
+    const stock = (await request("/stock")).body;
+    assert.equal((await request("/inventory-alerts", "PUT", { ...config, rules: [...initial.rules as Row[], { ...rule, lowThreshold: 0, reorderThreshold: 0 }] })).status, 200);
+    assert.deepEqual(await alerts(), []);
+    assert.deepEqual((await request("/products")).body, catalog);
+    assert.deepEqual((await request("/stock")).body, stock);
+    assert.equal((await request("/inventory-alerts", "PUT", { rules: initial.rules, recipients: initial.recipients })).status, 200);
   });
 
   it("gates a separate raw-material BOM view, validates structures and preserves catalog and stock", async () => {

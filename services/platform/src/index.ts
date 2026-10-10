@@ -676,6 +676,19 @@ async function api(
 
   const user = requireUser(parseUser(request));
   if (!canAccessApi(user.role, path[0], method)) throw new AppError("Your workspace role does not have access to this resource.", 403);
+  if (path[0] === "inventory-alerts" && path.length === 1) {
+    requireAdmin(user);
+    if (method === "GET") { sendJson(response, 200, notifications.settings.read()); return; }
+    if (method === "PUT") {
+      const body = await readBody(request);
+      requireAdmin(requireUser(parseUser(request)));
+      db.exec("BEGIN IMMEDIATE");
+      try { notifications.settings.save(body); notifications.sync(); db.exec("COMMIT"); }
+      catch (error) { db.exec("ROLLBACK"); throw error; }
+      sendJson(response, 200, notifications.settings.read()); return;
+    }
+    throw new AppError("Inventory alerts endpoint not found.", 404);
+  }
   if (path[0] === "profile-pictures" && path.length === 2 && method === "GET") {
     const picture = db.prepare("SELECT p.image FROM user_profile_pictures p JOIN users u ON u.id = p.user_id WHERE p.user_id = ? AND u.active = 1").get(path[1]);
     if (!picture) throw new AppError("Profile picture not found.", 404);
@@ -1117,6 +1130,7 @@ async function api(
         : path[2] === "communications" ? commerce.communicate(path[1], body, user)
         : undefined;
       if (!result) throw new AppError("Order action not found.", 404);
+      notifications.sync();
       sendJson(response, 200, result);
       return;
     }
